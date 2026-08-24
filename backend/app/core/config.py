@@ -1,0 +1,53 @@
+from typing import Literal
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    environment: Literal["development", "production", "test"] = "development"
+    debug: bool = False
+    database_url: str
+    jwt_secret_key: str
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 60
+    finnhub_api_key: str | None = None
+    finnhub_base_url: str = "https://finnhub.io/api/v1"
+    openai_api_key: str | None = None
+    openai_model: str = "gpt-4o-mini"
+    openai_embedding_model: str = "text-embedding-3-small"
+    cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
+    frontend_url: str | None = "http://localhost:5173"
+    max_request_body_bytes: int = 1_000_000
+    research_rate_limit_per_minute: int = 5
+
+    @field_validator("debug", mode="before")
+    @classmethod
+    def normalize_debug(cls, value):
+        # Supports legacy local .env values such as DEBUG=release without treating them as debug-enabled.
+        if isinstance(value, str) and value.lower() in {"release", "production"}:
+            return False
+        return value
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def normalize_postgres_url(cls, value):
+        # Managed providers commonly expose postgres:// URLs; SQLAlchemy needs
+        # the installed Psycopg v3 dialect explicitly.
+        if isinstance(value, str) and value.startswith("postgresql://"):
+            return "postgresql+psycopg://" + value.removeprefix("postgresql://")
+        return value
+
+    @model_validator(mode="after")
+    def validate_production(self):
+        if self.environment == "production":
+            if self.debug or self.jwt_secret_key in {"replace-with-a-long-random-secret", "test-secret"} or len(self.jwt_secret_key) < 32:
+                raise ValueError("Production requires DEBUG=false and a strong JWT_SECRET_KEY.")
+            if not self.database_url.startswith("postgresql+"):
+                raise ValueError("Production requires a PostgreSQL DATABASE_URL.")
+            if not self.cors_origins or "*" in self.cors_origins:
+                raise ValueError("Production requires explicit CORS_ORIGINS.")
+        return self
+
+
+settings = Settings()
