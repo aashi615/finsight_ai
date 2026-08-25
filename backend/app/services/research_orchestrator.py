@@ -80,22 +80,10 @@ class ResearchOrchestrator:
         # Fetch sync providers off the event loop; yfinance is blocking.
         to_date = datetime.now(timezone.utc).date()
         from_date = to_date - timedelta(days=30)
-        try:
-            _, market_rows = await self.research_service.get_market_data_async(db, company.ticker, from_date, to_date)
-        except HTTPException as exc:
-            # Price history is useful but must not make all research unavailable.  The
-            # market agent and synthesis prompt explicitly represent this limitation
-            # and will never infer prices or returns without supplied price evidence.
-            if not self._is_market_data_failure(exc):
-                raise
-            market_rows = []
-            logger.warning(
-                "continuing research without historical market data",
-                extra={"job_id": str(job.id), "company": company.ticker, "provider_status_code": exc.status_code, "error_category": "historical_market_data_unavailable"},
-            )
-        _, news_rows = self.research_service.get_news(db, company.ticker, from_date, to_date, limit=20)
+        _, market_rows = await self.research_service.get_market_data_async(db, company.ticker, from_date, to_date)
+        _, news_rows = self.research_service.get_news(db, company.ticker, from_date, to_date, limit=10)
         context = {"company": company, "market": market_rows, "news": news_rows, "question": job.question}
-        chunks = self.rag_service.retrieve(db, job.organization_id, job.question, company.id)
+        chunks = self.rag_service.retrieve(db, job.organization_id, job.question, company.id, limit=3)
         market_result, news_result, document_result = await asyncio.gather(
             self._run_agent(job, company.ticker, "market_analyst", self.market_agent.analyze(context)),
             self._run_agent(job, company.ticker, "news_analyst", self.news_agent.analyze(context)),

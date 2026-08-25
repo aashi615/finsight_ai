@@ -38,7 +38,7 @@ class MarketAnalystAgent:
         result = await self._complete(MarketAnalysis, market.PROMPT, payload)
         return _only_supplied_evidence(result.model_copy(update={"metrics": metrics}), evidence)
     async def _complete(self, model, prompt, payload):
-        try: return _validate(model, await asyncio.to_thread(self.llm.complete_json, prompt, payload))
+        try: return _validate(model, await self.llm.complete_json(prompt, payload, agent="market_analyst", max_output_tokens=900))
         except LLMProviderError as exc: raise AgentFailure("Market agent failed.") from exc
 
 
@@ -49,8 +49,9 @@ class NewsAnalystAgent:
         evidence = [Evidence(source_type="NEWS", source_id=str(article.id), snippet=article.title, url=article.url) for article in articles]
         if not articles:
             return NewsAnalysis(summary="No recent news is available.", themes=[], signals=[], evidence=[])
-        payload = {"question": context["question"], "articles": [{"title": article.title, "summary": article.summary, "published_at": article.published_at.isoformat()} for article in articles], "evidence": [item.model_dump() for item in evidence]}
-        try: return _only_supplied_evidence(_validate(NewsAnalysis, await asyncio.to_thread(self.llm.complete_json, news.PROMPT, payload)), evidence)
+        evidence = evidence[:10]
+        payload = {"question": context["question"], "articles": [{"title": article.title, "summary": (article.summary or "")[:500], "published_at": article.published_at.isoformat()} for article in articles[:10]], "evidence": [item.model_dump() for item in evidence]}
+        try: return _only_supplied_evidence(_validate(NewsAnalysis, await self.llm.complete_json(news.PROMPT, payload, agent="news_analyst", max_output_tokens=900)), evidence)
         except LLMProviderError as exc: raise AgentFailure("News agent failed.") from exc
 
 
@@ -60,8 +61,9 @@ class DocumentRagAgent:
         evidence = [Evidence(source_type="DOCUMENT", source_id=str(chunk.id), snippet=chunk.content[:500], url=chunk.source_url) for chunk in chunks]
         if not chunks:
             return DocumentAnalysis(summary="No tenant-owned documents matched this request.", findings=[], evidence=[])
-        payload = {"question": question, "chunks": [{"document_id": str(chunk.document_id), "source": chunk.source_url, "page_number": chunk.page_number, "section": chunk.section, "chunk_index": chunk.chunk_index, "text": chunk.content} for chunk in chunks], "evidence": [item.model_dump() for item in evidence]}
-        try: return _only_supplied_evidence(_validate(DocumentAnalysis, await asyncio.to_thread(self.llm.complete_json, document.PROMPT, payload)), evidence)
+        evidence = evidence[:3]
+        payload = {"question": question, "chunks": [{"document_id": str(chunk.document_id), "source": chunk.source_url, "page_number": chunk.page_number, "section": chunk.section, "chunk_index": chunk.chunk_index, "text": chunk.content[:800]} for chunk in chunks[:3]], "evidence": [item.model_dump() for item in evidence]}
+        try: return _only_supplied_evidence(_validate(DocumentAnalysis, await self.llm.complete_json(document.PROMPT, payload, agent="document_rag_agent", max_output_tokens=700)), evidence)
         except LLMProviderError as exc: raise AgentFailure("Document agent failed.") from exc
 
 
@@ -73,7 +75,7 @@ class ResearchSynthesizer:
             raise AgentFailure("Research cannot be synthesized without evidence.")
         supplied_evidence = [*market_analysis.evidence, *news_analysis.evidence, *document_analysis.evidence]
         payload = {"company": {"ticker": company.ticker, "name": company.name}, "market": market_analysis.model_dump(), "news": news_analysis.model_dump(), "documents": document_analysis.model_dump(), "allowed_evidence": [item.model_dump() for item in supplied_evidence]}
-        try: result = _validate(ResearchSynthesis, await asyncio.to_thread(self.llm.complete_json, synthesis.PROMPT, payload))
+        try: result = _validate(ResearchSynthesis, await self.llm.complete_json(synthesis.PROMPT, payload, agent="research_synthesizer", max_output_tokens=1500))
         except LLMProviderError as exc: raise AgentFailure("Synthesizer failed.") from exc
         returned = {evidence_identity(item) for item in result.evidence}
         if not returned.issubset(allowed):

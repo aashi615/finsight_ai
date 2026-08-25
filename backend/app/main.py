@@ -12,7 +12,7 @@ from app.core.logging import configure_logging
 configure_logging()
 logger = logging.getLogger(__name__)
 app = FastAPI(title="EquityLens API", version="0.1.0", debug=settings.debug, openapi_tags=[{"name": "auth", "description": "Authentication"}, {"name": "organization", "description": "Tenant organization"}, {"name": "companies", "description": "Canonical market data"}, {"name": "research", "description": "Tenant research jobs"}, {"name": "reports", "description": "Tenant research reports"}, {"name": "health", "description": "Deployment health"}])
-app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_credentials=False, allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"], allow_headers=["Authorization", "Content-Type"])
+app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_credentials=False, allow_methods=["GET", "POST", "PATCH", "OPTIONS"], allow_headers=["Authorization", "Content-Type"])
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(organization.router, prefix="/api/v1")
 app.include_router(admin.router, prefix="/api/v1")

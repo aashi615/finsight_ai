@@ -74,7 +74,7 @@ def test_provider_failure_is_controlled_and_job_fails(client):
     assert client.get(f"/api/v1/research/{job_id}", headers=auth_headers(account["access_token"])).json()["data"]["status"] == "FAILED"
 
 
-def test_both_historical_market_providers_failing_still_creates_a_clearly_limited_report(client):
+def test_both_historical_market_providers_failing_marks_job_with_clear_error(client):
     class MarketUnavailableProvider(FakeResearchProvider):
         def get_market_data(self, ticker, from_date, to_date):
             raise ProviderError("historical providers unavailable", status_code=503)
@@ -86,9 +86,9 @@ def test_both_historical_market_providers_failing_still_creates_a_clearly_limite
     response = client.post("/api/v1/research", json={"ticker": "NVDA", "question": "Analyze the company's recent performance and major risks."}, headers=auth_headers(account["access_token"]))
     assert response.status_code == 200
     job_id = response.json()["data"]["id"]
-    finished = client.get(f"/api/v1/research/{job_id}", headers=auth_headers(account["access_token"])).json()["data"]
-    assert finished["status"] == "COMPLETED"
-    assert finished["report_id"]
+    failed = client.get(f"/api/v1/research/{job_id}", headers=auth_headers(account["access_token"])).json()["data"]
+    assert failed["status"] == "FAILED"
+    assert failed["error_message"] == "Historical market data is unavailable from all configured providers."
 
 
 def test_required_news_provider_failure_still_fails_research_job(client):
