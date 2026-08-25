@@ -19,15 +19,18 @@ class Settings(BaseSettings):
     llm_provider: Literal["groq", "openai"] = "groq"
     groq_api_key: str | None = None
     llm_model: str = "openai/gpt-oss-120b"
+    # GPT-OSS 20B is the least expensive stable model for normal compact work.
+    # Qwen is only used after GPT-OSS spends its completion budget on reasoning.
     groq_research_model: str = "openai/gpt-oss-20b"
-    groq_final_model: str = "openai/gpt-oss-120b"
+    groq_final_model: str = "openai/gpt-oss-20b"
+    groq_reasoning_fallback_model: str = "qwen/qwen3.6-27b"
     max_llm_concurrency: int = 2
     # LLM budgets are deliberately conservative: Groq TPM includes prompt and
     # completion tokens, so these limits are part of the production contract.
-    news_max_output_tokens: int = 700
-    market_max_output_tokens: int = 700
-    rag_max_output_tokens: int = 700
-    final_max_output_tokens: int = 1200
+    news_max_output_tokens: int = 1000
+    market_max_output_tokens: int = 1000
+    rag_max_output_tokens: int = 1000
+    final_max_output_tokens: int = 1000
     groq_tpm_limit: int = 8000
     groq_safe_tpm_limit: int = 7000
     max_llm_retries: int = 2

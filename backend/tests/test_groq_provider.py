@@ -8,8 +8,8 @@ from app.llm.base import LLMProviderError
 from app.llm.groq_provider import GroqProvider, TokenBudgetManager, extract_json_object, normalize_json_response
 
 
-def completion(payload=None, *, finish_reason="stop", output_tokens=7):
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload or {"ok": True})), finish_reason=finish_reason)], usage=SimpleNamespace(prompt_tokens=11, completion_tokens=output_tokens, total_tokens=18), _request_id="req_groq")
+def completion(payload=None, *, finish_reason="stop", output_tokens=7, content=None, reasoning=None):
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload or {"ok": True}) if content is None else content, reasoning=reasoning), finish_reason=finish_reason)], usage=SimpleNamespace(prompt_tokens=11, completion_tokens=output_tokens, total_tokens=18), _request_id="req_groq")
 
 
 class Chat:
@@ -44,12 +44,13 @@ def test_groq_complete_json_with_stop_succeeds():
     assert asyncio.run(provider.complete_json("prompt", {}, agent="market_analyst", max_output_tokens=2000)) == {"ok": True}
 
 
-def test_groq_incomplete_response_retries_once_then_succeeds():
+def test_groq_incomplete_response_retries_once_with_a_compact_request():
     fake = client([completion({"partial": True}, finish_reason="length", output_tokens=2000), completion({"ok": True}, finish_reason="stop")])
     provider = GroqProvider(api_key="test", client=fake)
     assert asyncio.run(provider.complete_json("prompt", {}, agent="market_analyst", max_output_tokens=2000)) == {"ok": True}
     assert fake.chat.completions.calls == 2
-    assert "Retry instruction:" in fake.chat.completions.requests[1]["messages"][0]["content"]
+    assert "smallest valid JSON" in fake.chat.completions.requests[1]["messages"][0]["content"]
+    assert fake.chat.completions.requests[0]["messages"] != fake.chat.completions.requests[1]["messages"]
 
 
 def test_groq_incomplete_response_twice_fails_without_infinite_retries():
@@ -61,13 +62,14 @@ def test_groq_incomplete_response_twice_fails_without_infinite_retries():
     assert fake.chat.completions.calls == 2
 
 
-def test_groq_market_request_uses_local_json_contract_with_hidden_reasoning():
+def test_groq_market_request_uses_supported_low_reasoning_configuration():
     fake = client([completion()])
     provider = GroqProvider(api_key="test", client=fake)
     asyncio.run(provider.complete_json("Return ONLY valid JSON.", {"a": 1}, agent="market_analyst", max_output_tokens=900))
     request = fake.chat.completions.requests[0]
-    assert request["reasoning_format"] == "hidden"
-    assert "response_format" not in request
+    assert request["reasoning_effort"] == "low"
+    assert request["include_reasoning"] is False
+    assert request["response_format"] == {"type": "json_object"}
     assert request["messages"] == [{"role": "user", "content": "Return ONLY valid JSON.\n\nInput data:\n{\"a\": 1}"}]
 
 
@@ -121,7 +123,7 @@ def test_groq_sdk_gpt_oss_message_shape_parses_final_content_not_reasoning():
     sdk_response = SimpleNamespace(
         choices=[SimpleNamespace(
             finish_reason="stop",
-            message=SimpleNamespace(content='{"ok": true}', reasoning_content="internal reasoning", tool_calls=None),
+            message=SimpleNamespace(content='{"ok": true}', reasoning="internal reasoning", tool_calls=None),
         )],
         usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7, total_tokens=18),
         _request_id="req_gpt_oss",
@@ -175,10 +177,10 @@ def test_groq_enforces_agent_output_budgets():
     fake = client([completion(), completion(), completion(), completion()])
     provider = GroqProvider(api_key="test", client=fake, token_budget=TokenBudgetManager(7000))
     for agent, requested, expected in [
-        ("news_analyst", 4096, 700),
-        ("market_analyst", 4913, 700),
-        ("document_rag_agent", 900, 700),
-        ("research_synthesizer", 5000, 1200),
+        ("news_analyst", 4096, 1000),
+        ("market_analyst", 4913, 1000),
+        ("document_rag_agent", 2000, 1000),
+        ("research_synthesizer", 5000, 1000),
     ]:
         asyncio.run(provider.complete_json("prompt", {}, agent=agent, max_output_tokens=requested))
         assert fake.chat.completions.requests[-1]["max_completion_tokens"] == expected
@@ -198,3 +200,17 @@ def test_token_429_respects_retry_after_and_max_retry_count():
     provider = GroqProvider(api_key="test", client=fake, sleep=delays.append, random_value=lambda: 0, token_budget=TokenBudgetManager(7000))
     assert asyncio.run(provider.complete_json("prompt", {}, agent="news_analyst", max_output_tokens=700)) == {"ok": True}
     assert delays == [3] and fake.chat.completions.calls == 2
+
+
+def test_empty_gpt_oss_length_response_uses_non_thinking_fallback_not_same_request():
+    fake = client([
+        completion(finish_reason="length", output_tokens=520, content="", reasoning=None),
+        completion({"ok": True}),
+    ])
+    provider = GroqProvider(api_key="test", client=fake, token_budget=TokenBudgetManager(7000))
+    assert asyncio.run(provider.complete_json("prompt", {"articles": ["x" * 400]}, agent="news_analyst", max_output_tokens=480)) == {"ok": True}
+    first, second = fake.chat.completions.requests
+    assert first["model"] == "openai/gpt-oss-20b"
+    assert second["model"] == "qwen/qwen3.6-27b"
+    assert second["reasoning_effort"] == "none"
+    assert first["messages"] != second["messages"]

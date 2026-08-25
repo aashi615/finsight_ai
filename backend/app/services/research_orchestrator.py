@@ -79,7 +79,7 @@ class ResearchOrchestrator:
 
     @staticmethod
     def _failure_message(category: str) -> str:
-        messages = {"llm_quota_exhausted": "Research processing failed: the LLM provider quota is exhausted.", "llm_rate_limit": "Research processing failed: the LLM provider is rate limited.", "llm_timeout": "Research processing failed: the LLM provider timed out.", "llm_incomplete_response": "Research processing failed: the LLM response was incomplete.", "llm_invalid_response": "Research processing failed: the LLM returned an invalid structured response.", "llm_provider_error": "Research processing failed: the LLM provider rejected the request."}
+        messages = {"llm_quota_exhausted": "Research processing failed: the LLM provider quota is exhausted.", "llm_rate_limit": "Research processing failed: the LLM provider is rate limited.", "llm_timeout": "Research processing failed: the LLM provider timed out.", "llm_reasoning_budget_exhausted": "Research processing failed: the LLM used its completion budget before returning a visible answer.", "llm_incomplete_response": "Research processing failed: the LLM response was incomplete.", "llm_invalid_response": "Research processing failed: the LLM returned an invalid structured response.", "llm_provider_error": "Research processing failed: the LLM provider rejected the request.", "research_insufficient_evidence": "Research processing failed: no usable evidence was returned by the research branches."}
         return messages.get(category, "Research processing failed.")
 
     async def _run_agents(self, db: Session, job: ResearchJob, company) -> tuple[ResearchSynthesis, dict]:

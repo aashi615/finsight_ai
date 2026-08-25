@@ -89,7 +89,7 @@ class ResearchSynthesizer:
         analyses = [analysis for analysis in (market_analysis, news_analysis, document_analysis) if analysis is not None]
         allowed = {evidence_identity(item) for analysis in analyses for item in analysis.evidence}
         if not allowed:
-            raise AgentFailure("Research cannot be synthesized without evidence.")
+            raise AgentFailure("Research cannot be synthesized because every branch was unavailable or returned no evidence.", category="research_insufficient_evidence")
         # This is intentionally the final boundary: no raw API or document data
         # is allowed beyond the three compact, independently-produced summaries.
         payload = {"news_summary": news_analysis.model_dump() if news_analysis else None, "market_summary": market_analysis.model_dump() if market_analysis else None, "rag_summary": document_analysis.model_dump() if document_analysis else None}

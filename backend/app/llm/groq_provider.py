@@ -152,6 +152,8 @@ class GroqProvider:
             transport_attempt = 0
             incomplete_retried = False
             active_prompt = prompt
+            force_compact_input = False
+            active_model = model
             request_attempt = 0
             while transport_attempt <= settings.max_llm_retries:
                 request_attempt += 1
@@ -161,21 +163,18 @@ class GroqProvider:
                 content = None
                 usage = None
                 try:
-                    messages, estimated_input_tokens, input_compacted = self._messages(active_prompt, payload, input_limit)
+                    messages, estimated_input_tokens, input_compacted = self._messages(active_prompt, payload, input_limit, force_compact=force_compact_input)
                     estimated_total_tokens = estimated_input_tokens + max_output_tokens
-                    self._wait_for_tpm(agent, model, estimated_input_tokens, max_output_tokens, estimated_total_tokens, request_attempt)
+                    self._wait_for_tpm(agent, active_model, estimated_input_tokens, max_output_tokens, estimated_total_tokens, request_attempt)
                     request = {
-                        "model": model,
+                        "model": active_model,
                         "messages": messages,
                         "max_completion_tokens": max_output_tokens,
                         "temperature": 0.2,
-                        # GPT-OSS supports hidden reasoning. We intentionally do not
-                        # use response_format/json_object here: production proves that
-                        # Groq's server-side JSON validator rejects these nested agent
-                        # contracts before the application can validate them locally.
-                        "reasoning_format": "hidden",
+                        "response_format": {"type": "json_object"},
+                        **self._reasoning_options(active_model),
                     }
-                    logger.info("llm_request_scheduled", extra={"provider": "groq", "agent": agent, "model": model, "estimated_input_tokens": estimated_input_tokens, "requested_max_output_tokens": max_output_tokens, "estimated_total_tokens": estimated_total_tokens, "available_tpm": self._token_budget.available(), "input_compacted": input_compacted, "retry_number": transport_attempt})
+                    logger.info("llm_request_scheduled", extra={"provider": "groq", "agent": agent, "model": active_model, "estimated_input_tokens": estimated_input_tokens, "requested_max_output_tokens": max_output_tokens, "estimated_total_tokens": estimated_total_tokens, "available_tpm": self._token_budget.available(), "input_compacted": input_compacted, "retry_number": transport_attempt})
                     response = self.client.chat.completions.create(**request)
                     request_id = getattr(response, "_request_id", None)
                     choice = response.choices[0]
@@ -184,16 +183,23 @@ class GroqProvider:
                     usage = getattr(response, "usage", None)
                     self._token_budget.reconcile_latest(estimated_total_tokens, getattr(usage, "total_tokens", None))
                     response_details = self._response_details(content, choice, message, request_id, usage)
-                    logger.info("groq_response_received", extra={"provider": "groq", "agent": agent, "model": model, "configured_output_limit": max_output_tokens, **response_details})
+                    logger.info("groq_response_received", extra={"provider": "groq", "agent": agent, "model": active_model, "configured_output_limit": max_output_tokens, **response_details})
                     if getattr(choice, "finish_reason", None) == "length":
-                        logger.warning("groq_incomplete_response", extra={"provider": "groq", "agent": agent, "model": model, "attempt": request_attempt, "configured_output_limit": max_output_tokens, **self._response_details(content, choice, message, request_id, usage, include_preview=True)})
+                        empty_visible_content = not isinstance(content, str) or not content.strip()
+                        event = "groq_reasoning_budget_exhausted" if empty_visible_content else "groq_output_budget_exhausted"
+                        logger.warning(event, extra={"provider": "groq", "agent": agent, "model": active_model, "attempt": request_attempt, "configured_output_limit": max_output_tokens, **self._response_details(content, choice, message, request_id, usage, include_preview=True)})
                         if not incomplete_retried:
                             incomplete_retried = True
-                            active_prompt = f"{prompt}\n\nRetry instruction: return a shorter complete JSON object now. Omit all nonessential wording; do not truncate."
+                            force_compact_input = True
+                            active_prompt = f"{prompt}\n\nReturn the smallest valid JSON object now. Use only required fields, empty arrays when there are no supported claims, and no prose outside JSON."
+                            if empty_visible_content and active_model != settings.groq_reasoning_fallback_model:
+                                active_model = settings.groq_reasoning_fallback_model
+                                logger.warning("llm_model_fallback", extra={"provider": "groq", "agent": agent, "from_model": model, "to_model": active_model, "reason": "empty_visible_content_at_completion_limit"})
                             continue
-                        raise LLMProviderError("Groq response was incomplete because it reached the output token limit.", category="llm_incomplete_response")
-                    parsed = self._parse_json_response(content, agent, request_id, response_details, model)
-                    logger.info("llm_usage", extra={"provider": "groq", "agent": agent, "model": model, "input_tokens": getattr(usage, "prompt_tokens", estimated_input_tokens), "output_tokens": getattr(usage, "completion_tokens", None), "total_tokens": getattr(usage, "total_tokens", None), "finish_reason": getattr(choice, "finish_reason", None), "configured_output_limit": max_output_tokens, "request_id": getattr(response, "_request_id", None)})
+                        category = "llm_reasoning_budget_exhausted" if empty_visible_content else "llm_incomplete_response"
+                        raise LLMProviderError("Groq exhausted the completion budget before returning visible JSON." if empty_visible_content else "Groq response was incomplete because it reached the output token limit.", category=category)
+                    parsed = self._parse_json_response(content, agent, request_id, response_details, active_model)
+                    logger.info("llm_usage", extra={"provider": "groq", "agent": agent, "model": active_model, "estimated_input_tokens": estimated_input_tokens, "requested_max_output_tokens": max_output_tokens, "estimated_total_tokens": estimated_total_tokens, "actual_prompt_tokens": getattr(usage, "prompt_tokens", estimated_input_tokens), "actual_completion_tokens": getattr(usage, "completion_tokens", None), "actual_total_tokens": getattr(usage, "total_tokens", None), "finish_reason": getattr(choice, "finish_reason", None), "visible_content_exists": bool(isinstance(content, str) and content.strip()), "reasoning_content_exists": self._reasoning_content(message) is not None, "request_id": getattr(response, "_request_id", None)})
                     return parsed
                 except (StructuredOutputParseError, TypeError, KeyError, IndexError) as exc:
                     stage = getattr(exc, "stage", "response_content")
@@ -205,12 +211,12 @@ class GroqProvider:
                     raise
                 except Exception as exc:
                     category, retryable, retry_after = self._classify_error(exc)
-                    self._log_error(agent, model, transport_attempt + 1, category, exc)
+                    self._log_error(agent, active_model, transport_attempt + 1, category, exc)
                     if not retryable or transport_attempt >= settings.max_llm_retries:
                         message = "Groq quota is exhausted." if category == "llm_quota_exhausted" else "Groq rejected the requested JSON output." if category == "llm_invalid_response" else "Groq provider is temporarily unavailable."
                         raise LLMProviderError(message, category=category) from exc
                     delay = self._retry_delay(transport_attempt, retry_after)
-                    logger.warning("llm_retry", extra={"provider": "groq", "agent": agent, "model": model, "attempt": transport_attempt + 1, "retry_delay_seconds": round(delay, 3), "error_category": category})
+                    logger.warning("llm_retry", extra={"provider": "groq", "agent": agent, "model": active_model, "attempt": transport_attempt + 1, "retry_delay_seconds": round(delay, 3), "error_category": category})
                     self._sleep(delay)
                     transport_attempt += 1
         raise AssertionError("unreachable")
@@ -218,6 +224,20 @@ class GroqProvider:
     @staticmethod
     def _model_for(agent: str) -> str:
         return settings.groq_final_model if agent == "research_synthesizer" else settings.groq_research_model
+
+    @staticmethod
+    def _reasoning_options(model: str) -> dict[str, Any]:
+        """Use only model-supported reasoning controls.
+
+        GPT-OSS cannot disable reasoning, but low effort avoids its medium default.
+        Qwen supports true non-thinking mode, which is the fallback for an empty
+        GPT-OSS response at the completion boundary.
+        """
+        if model.startswith("openai/gpt-oss-"):
+            return {"reasoning_effort": "low", "include_reasoning": False}
+        if model.startswith("qwen/"):
+            return {"reasoning_effort": "none", "include_reasoning": False}
+        return {}
 
     @staticmethod
     def _enforce_output_budget(agent: str, requested: int) -> int:
@@ -245,13 +265,13 @@ class GroqProvider:
             self._sleep(delay)
 
     @staticmethod
-    def _messages(prompt: str, payload: dict, input_limit: int) -> tuple[list[dict[str, str]], int, bool]:
+    def _messages(prompt: str, payload: dict, input_limit: int, *, force_compact: bool = False) -> tuple[list[dict[str, str]], int, bool]:
         payload_json = json.dumps(payload, default=str)
         content = f"{prompt}\n\nInput data:\n{payload_json}"
         estimated_tokens = _estimate_tokens(content)
-        if estimated_tokens <= input_limit:
+        if estimated_tokens <= input_limit and not force_compact:
             return [{"role": "user", "content": content}], estimated_tokens, False
-        compact_payload = _compact_payload(payload)
+        compact_payload = _compact_payload(payload, aggressive=force_compact)
         compact_json = json.dumps(compact_payload, default=str)
         compact_content = f"{prompt}\n\nInput data:\n{compact_json}"
         return [{"role": "user", "content": compact_content}], _estimate_tokens(compact_content), True
@@ -276,17 +296,25 @@ class GroqProvider:
             "status": 200,
             "request_id": request_id,
             "finish_reason": getattr(choice, "finish_reason", None),
+            "actual_prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "actual_completion_tokens": getattr(usage, "completion_tokens", None),
+            "actual_total_tokens": getattr(usage, "total_tokens", None),
             "output_tokens": getattr(usage, "completion_tokens", None),
             "content_type": type(content).__name__ if content is not None else None,
             "content_length": len(content) if isinstance(content, str) else None,
             "content_preview": preview,
             "content_empty": not bool(content and content.strip()) if isinstance(content, str) else content is None,
-            "reasoning_content_present": bool(getattr(message, "reasoning_content", None)),
+            "reasoning_content_present": GroqProvider._reasoning_content(message) is not None,
             "content_has_code_fence": "```" in content if isinstance(content, str) else False,
             "tool_calls_present": bool(getattr(message, "tool_calls", None)),
-            "response_format": "none",
-            "reasoning_format": "hidden",
+            "response_format": "json_object",
+            "reasoning_format": None,
         }
+
+    @staticmethod
+    def _reasoning_content(message: Any) -> Any:
+        # SDK response shape changed from reasoning_content to reasoning.
+        return getattr(message, "reasoning", None) or getattr(message, "reasoning_content", None)
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         return self._embeddings.embed(texts)
@@ -339,11 +367,11 @@ def _compact_text(text: str, limit: int = 280) -> str:
     return text[:cut if cut > 0 else limit].rstrip()
 
 
-def _compact_payload(value: Any) -> Any:
+def _compact_payload(value: Any, *, aggressive: bool = False) -> Any:
     if isinstance(value, str):
-        return _compact_text(value)
+        return _compact_text(value, 120 if aggressive else 280)
     if isinstance(value, list):
-        return [_compact_payload(item) for item in value[:6]]
+        return [_compact_payload(item, aggressive=aggressive) for item in value[:3 if aggressive else 6]]
     if isinstance(value, dict):
-        return {key: _compact_payload(item) for key, item in value.items()}
+        return {key: _compact_payload(item, aggressive=aggressive) for key, item in value.items()}
     return value
