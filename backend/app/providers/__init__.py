@@ -1,1 +1,3 @@
 from app.providers.finnhub import FinnhubProvider
+from app.providers.fallback_market import FallbackMarketDataProvider
+from app.providers.yahoo_finance import YahooFinanceProvider

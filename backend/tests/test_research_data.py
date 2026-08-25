@@ -7,6 +7,8 @@ from app.core.database import get_db
 from app.api.v1.companies import get_research_service
 from app.providers.base import CompanyData, MarketBarData, NewsArticleData, ProviderError
 from app.providers.finnhub import FinnhubProvider
+from app.providers.fallback_market import FallbackMarketDataProvider
+from app.providers.yahoo_finance import YahooFinanceProvider
 from app.services.research_service import ResearchService
 from .conftest import auth_headers, signup
 
@@ -95,6 +97,89 @@ def test_finnhub_candle_403_retains_status_without_exposing_the_api_key(monkeypa
         provider.get_market_data("NVDA", date(2026, 1, 1), date(2026, 1, 3))
     assert failure.value.status_code == 403
     assert api_key not in str(failure.value)
+
+
+def test_finnhub_resolves_company_name_to_canonical_ticker(monkeypatch):
+    responses = [
+        {"name": ""},
+        {"result": [{"symbol": "NVDA", "description": "NVIDIA Corporation"}]},
+        {"name": "NVIDIA Corporation", "exchange": "NASDAQ", "country": "US", "finnhubIndustry": "Semiconductors"},
+    ]
+
+    def fake_get(url, *, params, timeout):
+        request = httpx.Request("GET", url, params=params)
+        return type("Response", (), {"raise_for_status": lambda self: None, "json": lambda self: responses.pop(0)})()
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    company = FinnhubProvider(api_key="test-key", base_url="https://finnhub.test/api/v1").get_company("NVIDIA Corporation")
+    assert company.ticker == "NVDA"
+    assert company.name == "NVIDIA Corporation"
+
+
+class StaticMarketProvider:
+    def __init__(self, bars=None, error=None):
+        self.bars = bars or []
+        self.error = error
+        self.calls = 0
+
+    def get_market_data(self, ticker, from_date, to_date):
+        self.calls += 1
+        if self.error:
+            raise self.error
+        return self.bars
+
+
+def test_fallback_uses_finnhub_when_historical_data_is_available():
+    bar = FakeMarketProvider().get_market_data("NVDA", date(2026, 1, 1), date(2026, 1, 1))[0]
+    primary, yahoo = StaticMarketProvider([bar]), StaticMarketProvider()
+    bars = FallbackMarketDataProvider(primary, yahoo).get_market_data("NVDA", date(2026, 1, 1), date(2026, 1, 3))
+    assert bars == [bar]
+    assert primary.calls == 1 and yahoo.calls == 0
+
+
+def test_finnhub_403_falls_back_to_yahoo_with_real_normalized_rows(caplog):
+    bar = MarketBarData(timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc), open=Decimal("100"), high=Decimal("110"), low=Decimal("99"), close=Decimal("105"), volume=1234, source="yahoo_finance")
+    primary = StaticMarketProvider(error=ProviderError("forbidden", status_code=403))
+    yahoo = StaticMarketProvider([bar])
+    bars = FallbackMarketDataProvider(primary, yahoo).get_market_data("NVDA", date(2026, 1, 1), date(2026, 1, 3))
+    assert bars == [bar]
+    assert yahoo.calls == 1
+    assert "falling back to Yahoo Finance" in caplog.text
+    assert "Yahoo Finance historical market data fetched successfully" in caplog.text
+    assert "forbidden" not in caplog.text
+
+
+def test_both_historical_market_providers_failing_raises_clear_error():
+    provider = FallbackMarketDataProvider(StaticMarketProvider(error=ProviderError("forbidden", status_code=403)), StaticMarketProvider(error=ProviderError("empty history")))
+    with pytest.raises(ProviderError, match="Finnhub and Yahoo Finance"):
+        provider.get_market_data("NVDA", date(2026, 1, 1), date(2026, 1, 3))
+
+
+def test_yahoo_history_is_normalized_and_invalid_rows_are_rejected(monkeypatch):
+    class History:
+        empty = False
+        def iterrows(self):
+            yield datetime(2026, 1, 2, 16, tzinfo=timezone.utc), {"Open": 100.1, "High": 105.2, "Low": 99.5, "Close": 104.75, "Volume": 123456}
+    class Ticker:
+        def __init__(self, symbol): self.symbol = symbol
+        def history(self, **kwargs):
+            assert kwargs["start"] == date(2026, 1, 1)
+            assert kwargs["end"] == date(2026, 1, 4)  # Yahoo's exclusive end includes Jan 3.
+            assert kwargs["interval"] == "1d" and kwargs["auto_adjust"] is False
+            return History()
+    monkeypatch.setattr("app.providers.yahoo_finance.yf.Ticker", Ticker)
+    bars = YahooFinanceProvider().get_market_data("NVDA", date(2026, 1, 1), date(2026, 1, 3))
+    assert bars == [MarketBarData(timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc), open=Decimal("100.1"), high=Decimal("105.2"), low=Decimal("99.5"), close=Decimal("104.75"), volume=123456, source="yahoo_finance")]
+
+
+def test_yahoo_empty_history_raises_clear_provider_error(monkeypatch):
+    class History: empty = True
+    class Ticker:
+        def __init__(self, symbol): pass
+        def history(self, **kwargs): return History()
+    monkeypatch.setattr("app.providers.yahoo_finance.yf.Ticker", Ticker)
+    with pytest.raises(ProviderError, match="no historical market data"):
+        YahooFinanceProvider().get_market_data("NVDA", date(2026, 1, 1), date(2026, 1, 3))
 
 
 def test_news_is_normalized_deduplicated_and_persisted(client):

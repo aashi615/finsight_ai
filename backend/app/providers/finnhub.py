@@ -28,8 +28,25 @@ class FinnhubProvider:
     def get_company(self, ticker: str) -> CompanyData:
         data = self._get("/stock/profile2", {"symbol": ticker})
         if not isinstance(data, dict) or not data.get("name"):
-            raise UnknownTickerError("Ticker was not found.")
-        return CompanyData(ticker=ticker, name=str(data["name"]), exchange=data.get("exchange"), country=data.get("country"), industry=data.get("finnhubIndustry"))
+            data = self._find_company_by_name(ticker)
+        if not isinstance(data, dict) or not data.get("name"):
+            raise UnknownTickerError("Ticker or company name was not found.")
+        return CompanyData(ticker=str(data.get("ticker") or ticker), name=str(data["name"]), exchange=data.get("exchange"), country=data.get("country"), industry=data.get("finnhubIndustry"))
+
+    def _find_company_by_name(self, query: str) -> dict | None:
+        """Resolve a company name to its exchange ticker without exposing search payloads."""
+        data = self._get("/search", {"q": query})
+        if not isinstance(data, dict) or not isinstance(data.get("result"), list):
+            raise ProviderError("Provider returned malformed company search data.")
+        candidates = [item for item in data["result"] if isinstance(item, dict) and item.get("symbol") and item.get("description")]
+        if not candidates:
+            return None
+        normalized_query = query.strip().casefold()
+        best = next((item for item in candidates if str(item["description"]).casefold() == normalized_query), candidates[0])
+        profile = self._get("/stock/profile2", {"symbol": str(best["symbol"])})
+        if not isinstance(profile, dict) or not profile.get("name"):
+            return None
+        return {**profile, "ticker": str(best["symbol"])}
 
     def get_market_data(self, ticker: str, from_date: date, to_date: date) -> list[MarketBarData]:
         start = int(datetime.combine(from_date, datetime.min.time(), tzinfo=timezone.utc).timestamp())

@@ -5,6 +5,8 @@ from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.models.user import User
 from app.providers.finnhub import FinnhubProvider
+from app.providers.fallback_market import FallbackMarketDataProvider
+from app.providers.yahoo_finance import YahooFinanceProvider
 from app.schemas.common import SuccessResponse
 from app.schemas.company import CompanyContextOut, CompanyOut, MarketDataOut, NewsArticleOut
 from app.services.research_service import ResearchService
@@ -13,8 +15,8 @@ router = APIRouter(prefix="/companies", tags=["companies"])
 
 
 def get_research_service() -> ResearchService:
-    provider = FinnhubProvider()
-    return ResearchService(market_provider=provider, news_provider=provider)
+    finnhub = FinnhubProvider()
+    return ResearchService(market_provider=FallbackMarketDataProvider(finnhub, YahooFinanceProvider()), news_provider=finnhub)
 
 
 def resolve_dates(from_date: date | None, to_date: date | None) -> tuple[date, date]:

@@ -1,5 +1,5 @@
 from uuid import UUID
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 from app.models.research_report import ResearchReport
 
@@ -18,3 +18,7 @@ class ResearchReportRepository:
         query = select(ResearchReport).where(ResearchReport.organization_id == organization_id)
         total = len(list(db.scalars(query)))
         return list(db.scalars(query.order_by(ResearchReport.created_at.desc()).offset(offset).limit(limit))), total
+
+    def delete_all_in_organization(self, db: Session, organization_id: UUID) -> int:
+        result = db.execute(delete(ResearchReport).where(ResearchReport.organization_id == organization_id))
+        return int(result.rowcount or 0)

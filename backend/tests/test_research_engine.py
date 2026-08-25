@@ -74,29 +74,21 @@ def test_provider_failure_is_controlled_and_job_fails(client):
     assert client.get(f"/api/v1/research/{job_id}", headers=auth_headers(account["access_token"])).json()["data"]["status"] == "FAILED"
 
 
-def test_forbidden_historical_market_data_is_optional_and_never_logs_api_key(client, caplog):
-    class CandleForbiddenProvider(FakeResearchProvider):
+def test_both_historical_market_providers_failing_marks_job_with_clear_error(client):
+    class MarketUnavailableProvider(FakeResearchProvider):
         def get_market_data(self, ticker, from_date, to_date):
-            raise ProviderError("forbidden", status_code=403)
+            raise ProviderError("historical providers unavailable", status_code=503)
 
-    provider = CandleForbiddenProvider()
+    provider = MarketUnavailableProvider()
     llm = FakeLLMProvider()
     client.app.dependency_overrides[get_orchestrator] = lambda: ResearchOrchestrator(ResearchService(provider, provider), RagService(llm), MarketAnalystAgent(llm), NewsAnalystAgent(llm), DocumentRagAgent(llm), ResearchSynthesizer(llm))
     account = signup(client)
     response = client.post("/api/v1/research", json={"ticker": "NVDA", "question": "Analyze the company's recent performance and major risks."}, headers=auth_headers(account["access_token"]))
     assert response.status_code == 200
     job_id = response.json()["data"]["id"]
-    completed = client.get(f"/api/v1/research/{job_id}", headers=auth_headers(account["access_token"])).json()["data"]
-    assert completed["status"] == "COMPLETED"
-    assert "Historical market-price data is unavailable" in completed["result"]["market_analysis"]
-    assert len(llm.calls) == 2  # News analysis and synthesis still run; no candles are fabricated.
-    warning = next(record for record in caplog.records if record.getMessage() == "Historical market data unavailable; continuing research")
-    assert warning.job_id == job_id
-    assert warning.company == "NVDA"
-    assert warning.provider == "finnhub"
-    assert warning.provider_status_code == 403
-    assert "forbidden" not in caplog.text
-    assert "token" not in caplog.text.lower()
+    failed = client.get(f"/api/v1/research/{job_id}", headers=auth_headers(account["access_token"])).json()["data"]
+    assert failed["status"] == "FAILED"
+    assert failed["error_message"] == "Historical market data is unavailable from all configured providers."
 
 
 def test_required_news_provider_failure_still_fails_research_job(client):
@@ -129,3 +121,16 @@ def test_research_and_reports_are_paginated_and_tenant_scoped(client):
     reports = client.get("/api/v1/reports?page=1&page_size=1", headers=headers).json()["data"]
     assert len(reports["items"]) == 1 and reports["total"] == 2
     assert client.get(f"/api/v1/reports/{reports['items'][0]['id']}", headers=auth_headers(second["access_token"])).status_code == 404
+
+
+def test_admin_can_delete_only_its_organization_research_history(client):
+    first = signup(client, email="clear-one@example.com", organization_name="Clear One")
+    second = signup(client, email="clear-two@example.com", organization_name="Clear Two")
+    client.app.dependency_overrides[get_orchestrator] = make_orchestrator
+    for account in (first, second):
+        client.post("/api/v1/research", json={"ticker": "NVDA", "question": "Analyze recent performance."}, headers=auth_headers(account["access_token"]))
+    deleted = client.delete("/api/v1/research", headers=auth_headers(first["access_token"]))
+    assert deleted.status_code == 200
+    assert deleted.json()["data"]["deleted_jobs"] == 1
+    assert client.get("/api/v1/research", headers=auth_headers(first["access_token"])).json()["data"]["total"] == 0
+    assert client.get("/api/v1/research", headers=auth_headers(second["access_token"])).json()["data"]["total"] == 1

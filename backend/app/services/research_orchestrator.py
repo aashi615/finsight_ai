@@ -66,34 +66,21 @@ class ResearchOrchestrator:
         except Exception as exc:
             db.rollback()
             job.status = ResearchJobStatus.FAILED
-            job.error_message = "Research processing failed."
+            job.error_message = "Historical market data is unavailable from all configured providers." if self._is_market_data_failure(exc) else "Research processing failed."
             job.completed_at = datetime.now(timezone.utc)
             db.commit()
             logger.warning("research job failed", extra={"job_id": str(job.id), "company": company.ticker, "duration_seconds": round(time.monotonic() - started, 3), "error_type": type(exc).__name__, "error_category": "research_processing"})
             return job
 
+    @staticmethod
+    def _is_market_data_failure(exc: Exception) -> bool:
+        return isinstance(exc, HTTPException) and exc.status_code == 503 and isinstance(exc.detail, dict) and exc.detail.get("code") == "PROVIDER_UNAVAILABLE"
+
     async def _run_agents(self, db: Session, job: ResearchJob, company) -> ResearchSynthesis:
-        # Refresh the bounded Day 3 research window before constructing context.
-        # The data service retains its existing caching and provider-error behavior.
+        # Fetch sync providers off the event loop; yfinance is blocking.
         to_date = datetime.now(timezone.utc).date()
         from_date = to_date - timedelta(days=30)
-        try:
-            _, market_rows = self.research_service.get_market_data(db, company.ticker, from_date, to_date)
-        except HTTPException as exc:
-            if not self._is_market_provider_unavailable(exc):
-                raise
-            provider_error = exc.__cause__
-            logger.warning(
-                "Historical market data unavailable; continuing research",
-                extra={
-                    "job_id": str(job.id),
-                    "company": company.ticker,
-                    "provider": "finnhub",
-                    "provider_status_code": getattr(provider_error, "status_code", None),
-                    "error_category": "historical_market_data_unavailable",
-                },
-            )
-            market_rows = []
+        _, market_rows = await self.research_service.get_market_data_async(db, company.ticker, from_date, to_date)
         _, news_rows = self.research_service.get_news(db, company.ticker, from_date, to_date, limit=20)
         context = {"company": company, "market": market_rows, "news": news_rows, "question": job.question}
         chunks = self.rag_service.retrieve(db, job.organization_id, job.question, company.id)
@@ -103,10 +90,6 @@ class ResearchOrchestrator:
             self._run_agent(job, company.ticker, "document_rag_agent", self.document_agent.analyze(job.question, chunks)),
         )
         return await self.synthesizer.synthesize(company, market_result, news_result, document_result)
-
-    @staticmethod
-    def _is_market_provider_unavailable(exc: HTTPException) -> bool:
-        return exc.status_code == 503 and isinstance(exc.detail, dict) and exc.detail.get("code") == "PROVIDER_UNAVAILABLE"
 
     async def _run_agent(self, job: ResearchJob, ticker: str, agent_name: str, work):
         started = time.monotonic()

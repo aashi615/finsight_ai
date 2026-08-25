@@ -1,3 +1,4 @@
+import asyncio
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from urllib.parse import urlsplit, urlunsplit
@@ -42,9 +43,10 @@ class ResearchService:
             raise api_error(404, "UNKNOWN_TICKER", "Company ticker was not found.")
         except ProviderError:
             raise api_error(503, "PROVIDER_UNAVAILABLE", "Company data provider is unavailable.")
-        if not data.name or data.ticker.upper() != normalized_ticker:
+        canonical_ticker = data.ticker.strip().upper()
+        if not data.name or not canonical_ticker:
             raise api_error(502, "MALFORMED_PROVIDER_RESPONSE", "Company data provider returned invalid data.")
-        company = Company(ticker=normalized_ticker, name=data.name.strip(), exchange=data.exchange, country=data.country, sector=data.sector, industry=data.industry)
+        company = Company(ticker=canonical_ticker, name=data.name.strip(), exchange=data.exchange, country=data.country, sector=data.sector, industry=data.industry)
         self.companies.create(db, company)
         db.commit()
         db.refresh(company)
@@ -58,6 +60,20 @@ class ResearchService:
             return company, cached
         try:
             bars = self.market_provider.get_market_data(company.ticker, from_date, to_date)
+        except ProviderError as exc:
+            raise api_error(503, "PROVIDER_UNAVAILABLE", "Market data provider is unavailable.") from exc
+        self._persist_market_data(db, company, bars)
+        return company, self.market_data.list_for_range(db, company.id, from_date, to_date)
+
+    async def get_market_data_async(self, db: Session, ticker: str, from_date: date, to_date: date) -> tuple[Company, list[MarketData]]:
+        """Fetch the blocking external historical provider without blocking the event loop."""
+        self._validate_range(from_date, to_date)
+        company = self.resolve_company(db, ticker)
+        cached = self.market_data.list_for_range(db, company.id, from_date, to_date)
+        if cached:
+            return company, cached
+        try:
+            bars = await asyncio.to_thread(self.market_provider.get_market_data, company.ticker, from_date, to_date)
         except ProviderError as exc:
             raise api_error(503, "PROVIDER_UNAVAILABLE", "Market data provider is unavailable.") from exc
         self._persist_market_data(db, company, bars)
