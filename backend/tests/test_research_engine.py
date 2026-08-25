@@ -142,6 +142,17 @@ def test_market_agent_schema_invalid_json_has_clear_validation_error():
     assert error.value.category == "llm_invalid_response"
 
 
+def test_market_agent_fails_when_the_provider_reports_two_incomplete_attempts():
+    class IncompleteLLM:
+        async def complete_json(self, *args, **kwargs):
+            from app.llm.base import LLMProviderError
+            raise LLMProviderError("Groq response was incomplete because it reached the output token limit.", category="llm_incomplete_response")
+
+    with pytest.raises(AgentFailure, match="Market agent failed") as error:
+        asyncio.run(MarketAnalystAgent(IncompleteLLM())._complete(MarketAnalysis, "prompt", {}))
+    assert error.value.category == "llm_incomplete_response"
+
+
 def test_research_and_reports_are_paginated_and_tenant_scoped(client):
     first = signup(client, email="reports-one@example.com", organization_name="Reports One")
     second = signup(client, email="reports-two@example.com", organization_name="Reports Two")

@@ -8,8 +8,8 @@ from app.llm.base import LLMProviderError
 from app.llm.groq_provider import GroqProvider, extract_json_object, normalize_json_response
 
 
-def completion(payload=None):
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload or {"ok": True})) )], usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7, total_tokens=18), _request_id="req_groq")
+def completion(payload=None, *, finish_reason="stop", output_tokens=7):
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload or {"ok": True})), finish_reason=finish_reason)], usage=SimpleNamespace(prompt_tokens=11, completion_tokens=output_tokens, total_tokens=18), _request_id="req_groq")
 
 
 class Chat:
@@ -37,6 +37,28 @@ def test_groq_provider_uses_configured_model_and_parses_json(monkeypatch):
     provider = GroqProvider(api_key="test", client=fake)
     assert asyncio.run(provider.complete_json("system", {"a": 1}, agent="market_analyst", max_output_tokens=900)) == {"ok": True}
     assert fake.chat.completions.calls == 1
+
+
+def test_groq_complete_json_with_stop_succeeds():
+    provider = GroqProvider(api_key="test", client=client([completion({"ok": True}, finish_reason="stop")]))
+    assert asyncio.run(provider.complete_json("prompt", {}, agent="market_analyst", max_output_tokens=2000)) == {"ok": True}
+
+
+def test_groq_incomplete_response_retries_once_then_succeeds():
+    fake = client([completion({"partial": True}, finish_reason="length", output_tokens=2000), completion({"ok": True}, finish_reason="stop")])
+    provider = GroqProvider(api_key="test", client=fake)
+    assert asyncio.run(provider.complete_json("prompt", {}, agent="market_analyst", max_output_tokens=2000)) == {"ok": True}
+    assert fake.chat.completions.calls == 2
+    assert "Retry instruction:" in fake.chat.completions.requests[1]["messages"][0]["content"]
+
+
+def test_groq_incomplete_response_twice_fails_without_infinite_retries():
+    fake = client([completion({"partial": True}, finish_reason="length", output_tokens=2000), completion({"still": "partial"}, finish_reason="length", output_tokens=2000)])
+    provider = GroqProvider(api_key="test", client=fake)
+    with pytest.raises(LLMProviderError, match="incomplete") as error:
+        asyncio.run(provider.complete_json("prompt", {}, agent="news_analyst", max_output_tokens=2000))
+    assert error.value.category == "llm_incomplete_response"
+    assert fake.chat.completions.calls == 2
 
 
 def test_groq_market_request_uses_local_json_contract_with_hidden_reasoning():
@@ -107,6 +129,14 @@ def test_groq_sdk_gpt_oss_message_shape_parses_final_content_not_reasoning():
     fake = client([sdk_response])
     provider = GroqProvider(api_key="test", client=fake)
     assert asyncio.run(provider.complete_json("prompt", {}, agent="market_analyst", max_output_tokens=900)) == {"ok": True}
+
+
+def test_groq_response_preview_is_reserved_for_failure_diagnostics():
+    choice = SimpleNamespace(finish_reason="stop")
+    message = SimpleNamespace(reasoning_content=None, tool_calls=None)
+    usage = SimpleNamespace(completion_tokens=4)
+    assert GroqProvider._response_details('{"safe": true}', choice, message, "req", usage)["content_preview"] is None
+    assert GroqProvider._response_details('{"safe": true}', choice, message, "req", usage, include_preview=True)["content_preview"] == '{"safe": true}'
 
 
 def test_groq_json_validation_failure_is_categorized_as_invalid_response():

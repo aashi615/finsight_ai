@@ -99,13 +99,21 @@ class GroqProvider:
         if not self.client:
             raise LLMProviderError("Groq provider is not configured.", category="llm_provider_error")
         with self._request_limiter:
-            for attempt in range(self._max_attempts):
+            transport_attempt = 0
+            incomplete_retried = False
+            active_prompt = prompt
+            request_attempt = 0
+            while transport_attempt < self._max_attempts:
+                request_attempt += 1
                 request_id = None
                 response_details: dict[str, Any] = {}
+                choice = message = None
+                content = None
+                usage = None
                 try:
                     request = {
                         "model": settings.llm_model,
-                        "messages": self._messages(prompt, payload, agent),
+                        "messages": self._messages(active_prompt, payload, agent),
                         "max_tokens": max_output_tokens,
                         "temperature": 0.2,
                         # GPT-OSS supports hidden reasoning. We intentionally do not
@@ -119,26 +127,37 @@ class GroqProvider:
                     choice = response.choices[0]
                     message = choice.message
                     content = getattr(message, "content", None)
-                    response_details = self._response_details(content, choice, message, request_id)
-                    logger.info("groq_response_received", extra={"provider": "groq", "agent": agent, "model": settings.llm_model, **response_details})
-                    parsed = self._parse_json_response(content, agent, request_id, response_details)
                     usage = getattr(response, "usage", None)
+                    response_details = self._response_details(content, choice, message, request_id, usage)
+                    logger.info("groq_response_received", extra={"provider": "groq", "agent": agent, "model": settings.llm_model, **response_details})
+                    if getattr(choice, "finish_reason", None) == "length":
+                        logger.warning("groq_incomplete_response", extra={"provider": "groq", "agent": agent, "model": settings.llm_model, "attempt": request_attempt, **self._response_details(content, choice, message, request_id, usage, include_preview=True)})
+                        if not incomplete_retried:
+                            incomplete_retried = True
+                            active_prompt = f"{prompt}\n\nRetry instruction: return a shorter complete JSON object now. Omit all nonessential wording; do not truncate."
+                            continue
+                        raise LLMProviderError("Groq response was incomplete because it reached the output token limit.", category="llm_incomplete_response")
+                    parsed = self._parse_json_response(content, agent, request_id, response_details)
                     logger.info("llm_usage", extra={"provider": "groq", "agent": agent, "model": settings.llm_model, "input_tokens": getattr(usage, "prompt_tokens", None), "output_tokens": getattr(usage, "completion_tokens", None), "total_tokens": getattr(usage, "total_tokens", None), "request_id": getattr(response, "_request_id", None)})
                     return parsed
                 except (StructuredOutputParseError, TypeError, KeyError, IndexError) as exc:
                     stage = getattr(exc, "stage", "response_content")
                     event = {"empty_response": "groq_empty_response", "json_extraction": "groq_json_extraction_failed", "json_decode": "groq_json_decode_failed"}.get(stage, "groq_json_parse_failed")
-                    logger.warning(event, extra={"provider": "groq", "agent": agent, "model": settings.llm_model, "request_id": request_id, "response_parsing_stage": stage, **response_details})
+                    diagnostics = self._response_details(content, choice, message, request_id, usage, include_preview=True) if choice is not None else response_details
+                    logger.warning(event, extra={"provider": "groq", "agent": agent, "model": settings.llm_model, "request_id": request_id, "response_parsing_stage": stage, **diagnostics})
                     raise LLMProviderError(f"Groq returned malformed JSON output at {stage}.", category="llm_invalid_response") from exc
+                except LLMProviderError:
+                    raise
                 except Exception as exc:
                     category, retryable, retry_after = self._classify_error(exc)
-                    self._log_error(agent, attempt + 1, category, exc)
-                    if not retryable or attempt == self._max_attempts - 1:
+                    self._log_error(agent, transport_attempt + 1, category, exc)
+                    if not retryable or transport_attempt == self._max_attempts - 1:
                         message = "Groq quota is exhausted." if category == "llm_quota_exhausted" else "Groq rejected the requested JSON output." if category == "llm_invalid_response" else "Groq provider is temporarily unavailable."
                         raise LLMProviderError(message, category=category) from exc
-                    delay = self._retry_delay(attempt, retry_after)
-                    logger.warning("llm_retry", extra={"provider": "groq", "agent": agent, "model": settings.llm_model, "attempt": attempt + 1, "retry_delay_seconds": round(delay, 3), "error_category": category})
+                    delay = self._retry_delay(transport_attempt, retry_after)
+                    logger.warning("llm_retry", extra={"provider": "groq", "agent": agent, "model": settings.llm_model, "attempt": transport_attempt + 1, "retry_delay_seconds": round(delay, 3), "error_category": category})
                     self._sleep(delay)
+                    transport_attempt += 1
         raise AssertionError("unreachable")
 
     @staticmethod
@@ -160,12 +179,13 @@ class GroqProvider:
         return parsed
 
     @staticmethod
-    def _response_details(content: Any, choice: Any, message: Any, request_id: str | None) -> dict[str, Any]:
-        preview = content[:1000] if isinstance(content, str) else None
+    def _response_details(content: Any, choice: Any, message: Any, request_id: str | None, usage: Any, *, include_preview: bool = False) -> dict[str, Any]:
+        preview = content[:1000] if include_preview and isinstance(content, str) else None
         return {
             "status": 200,
             "request_id": request_id,
             "finish_reason": getattr(choice, "finish_reason", None),
+            "output_tokens": getattr(usage, "completion_tokens", None),
             "content_type": type(content).__name__ if content is not None else None,
             "content_length": len(content) if isinstance(content, str) else None,
             "content_preview": preview,
