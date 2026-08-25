@@ -1,4 +1,6 @@
 import asyncio
+from datetime import datetime, timezone
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -6,7 +8,7 @@ import pytest
 from app.api.v1.research import get_orchestrator
 from app.core.database import get_db
 from app.providers.base import ProviderError
-from app.schemas.research import Evidence, MarketAnalysis
+from app.schemas.research import Evidence, MarketAnalysis, NewsAnalysis
 from app.services.agents import AgentFailure, DocumentRagAgent, MarketAnalystAgent, NewsAnalystAgent, ResearchSynthesizer
 from app.services.rag_service import RagService
 from app.services.research_orchestrator import ResearchOrchestrator
@@ -117,6 +119,17 @@ def test_market_agent_valid_json_parses_to_market_analysis():
 
     result = asyncio.run(MarketAnalystAgent(ValidLLM())._complete(MarketAnalysis, "prompt", {}))
     assert result == MarketAnalysis(summary="valid", metrics={"start_close": 100.0}, signals=[], evidence=[])
+
+
+def test_news_agent_valid_json_parses_to_news_analysis():
+    class ValidLLM:
+        async def complete_json(self, prompt, payload, **kwargs):
+            evidence = payload["evidence"]
+            return {"agent": "news_analyst", "summary": "valid", "themes": ["earnings"], "signals": [], "evidence": evidence}
+
+    article = SimpleNamespace(id="news-1", title="NVIDIA update", summary="Summary", url="https://example.test/news", published_at=datetime.now(timezone.utc))
+    result = asyncio.run(NewsAnalystAgent(ValidLLM()).analyze({"question": "What changed?", "news": [article]}))
+    assert result == NewsAnalysis(summary="valid", themes=["earnings"], signals=[], evidence=[{"source_type": "NEWS", "source_id": "news-1", "snippet": "NVIDIA update", "url": "https://example.test/news"}])
 
 
 def test_market_agent_schema_invalid_json_has_clear_validation_error():

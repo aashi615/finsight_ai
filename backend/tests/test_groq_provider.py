@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.llm.base import LLMProviderError
-from app.llm.groq_provider import GroqProvider
+from app.llm.groq_provider import GroqProvider, extract_json_object
 
 
 def completion(payload=None):
@@ -39,22 +39,34 @@ def test_groq_provider_uses_configured_model_and_parses_json(monkeypatch):
     assert fake.chat.completions.calls == 1
 
 
-def test_groq_market_request_uses_json_mode_hidden_reasoning_and_user_json_prompt():
+def test_groq_market_request_uses_local_json_contract_with_hidden_reasoning():
     fake = client([completion()])
     provider = GroqProvider(api_key="test", client=fake)
     asyncio.run(provider.complete_json("Return ONLY valid JSON.", {"a": 1}, agent="market_analyst", max_output_tokens=900))
     request = fake.chat.completions.requests[0]
-    assert request["response_format"] == {"type": "json_object"}
     assert request["reasoning_format"] == "hidden"
+    assert "response_format" not in request
     assert request["messages"] == [{"role": "user", "content": "Return ONLY valid JSON.\n\nInput data:\n{\"a\": 1}"}]
 
 
 def test_groq_malformed_json_is_a_clear_structured_output_error():
     malformed = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="not json"))])
     provider = GroqProvider(api_key="test", client=client([malformed]))
-    with pytest.raises(LLMProviderError, match="malformed structured output") as error:
+    with pytest.raises(LLMProviderError, match="malformed JSON output at json_decode") as error:
         asyncio.run(provider.complete_json("prompt", {}, agent="market_analyst", max_output_tokens=900))
     assert error.value.category == "llm_invalid_response"
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        (' {"ok": true} \n', {"ok": True}),
+        ('```json\n{"ok": true}\n```', {"ok": True}),
+        ('json\n{"ok": true}', {"ok": True}),
+    ],
+)
+def test_groq_extracts_supported_json_wrappers(content, expected):
+    assert extract_json_object(content) == expected
 
 
 def test_groq_json_validation_failure_is_categorized_as_invalid_response():

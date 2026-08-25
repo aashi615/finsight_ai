@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -14,6 +15,32 @@ from app.llm.base import LLMProviderError
 from app.llm.local_embeddings import LocalEmbeddingProvider
 
 logger = logging.getLogger(__name__)
+
+
+class StructuredOutputParseError(ValueError):
+    def __init__(self, stage: str):
+        super().__init__(stage)
+        self.stage = stage
+
+
+def extract_json_object(text: str) -> dict:
+    """Safely normalize common wrappers and return exactly one JSON object."""
+    if not isinstance(text, str):
+        raise StructuredOutputParseError("response_content")
+    normalized = text.strip()
+    fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", normalized, flags=re.DOTALL | re.IGNORECASE)
+    if fence:
+        normalized = fence.group(1).strip()
+    normalized = re.sub(r"^json\s*[:\n]?\s*", "", normalized, count=1, flags=re.IGNORECASE)
+    try:
+        parsed, end = json.JSONDecoder().raw_decode(normalized)
+    except json.JSONDecodeError as exc:
+        raise StructuredOutputParseError("json_decode") from exc
+    if normalized[end:].strip():
+        raise StructuredOutputParseError("trailing_content")
+    if not isinstance(parsed, dict):
+        raise StructuredOutputParseError("json_object")
+    return parsed
 
 
 class GroqProvider:
@@ -36,28 +63,29 @@ class GroqProvider:
             raise LLMProviderError("Groq provider is not configured.", category="llm_provider_error")
         with self._request_limiter:
             for attempt in range(self._max_attempts):
+                request_id = None
                 try:
                     request = {
                         "model": settings.llm_model,
                         "messages": self._messages(prompt, payload, agent),
-                        "response_format": {"type": "json_object"},
                         "max_tokens": max_output_tokens,
                         "temperature": 0.2,
+                        # GPT-OSS supports hidden reasoning. We intentionally do not
+                        # use response_format/json_object here: production proves that
+                        # Groq's server-side JSON validator rejects these nested agent
+                        # contracts before the application can validate them locally.
+                        "reasoning_format": "hidden",
                     }
-                    # GPT-OSS defaults to raw reasoning. Groq requires hidden or parsed
-                    # reasoning when JSON mode is requested.
-                    if agent == "market_analyst":
-                        request["reasoning_format"] = "hidden"
                     response = self.client.chat.completions.create(**request)
-                    content = response.choices[0].message.content
-                    parsed = json.loads(content)
-                    if not isinstance(parsed, dict):
-                        raise ValueError
+                    request_id = getattr(response, "_request_id", None)
+                    parsed = self._parse_json_response(response.choices[0].message.content, agent, request_id)
                     usage = getattr(response, "usage", None)
                     logger.info("llm_usage", extra={"provider": "groq", "agent": agent, "model": settings.llm_model, "input_tokens": getattr(usage, "prompt_tokens", None), "output_tokens": getattr(usage, "completion_tokens", None), "total_tokens": getattr(usage, "total_tokens", None), "request_id": getattr(response, "_request_id", None)})
                     return parsed
-                except (ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError) as exc:
-                    raise LLMProviderError("Groq returned malformed structured output.", category="llm_invalid_response") from exc
+                except (StructuredOutputParseError, TypeError, KeyError, IndexError) as exc:
+                    stage = getattr(exc, "stage", "response_content")
+                    logger.warning("llm_response_parse_failed", extra={"provider": "groq", "agent": agent, "model": settings.llm_model, "request_id": request_id, "response_parsing_stage": stage})
+                    raise LLMProviderError(f"Groq returned malformed JSON output at {stage}.", category="llm_invalid_response") from exc
                 except Exception as exc:
                     category, retryable, retry_after = self._classify_error(exc)
                     self._log_error(agent, attempt + 1, category, exc)
@@ -72,10 +100,13 @@ class GroqProvider:
     @staticmethod
     def _messages(prompt: str, payload: dict, agent: str) -> list[dict[str, str]]:
         payload_json = json.dumps(payload, default=str)
-        if agent == "market_analyst":
-            # Keep the JSON instruction in the user message for GPT-OSS JSON mode.
-            return [{"role": "user", "content": f"{prompt}\n\nInput data:\n{payload_json}"}]
-        return [{"role": "system", "content": prompt}, {"role": "user", "content": payload_json}]
+        return [{"role": "user", "content": f"{prompt}\n\nInput data:\n{payload_json}"}]
+
+    @staticmethod
+    def _parse_json_response(content: Any, agent: str, request_id: str | None = None) -> dict:
+        parsed = extract_json_object(content)
+        logger.info("llm_response_parsed", extra={"provider": "groq", "agent": agent, "model": settings.llm_model, "request_id": request_id, "response_parsing_stage": "json_loaded"})
+        return parsed
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         return self._embeddings.embed(texts)
