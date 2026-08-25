@@ -1,3 +1,4 @@
+import asyncio
 from uuid import UUID
 
 import pytest
@@ -6,7 +7,7 @@ from app.api.v1.research import get_orchestrator
 from app.core.database import get_db
 from app.providers.base import ProviderError
 from app.schemas.research import Evidence, MarketAnalysis
-from app.services.agents import DocumentRagAgent, MarketAnalystAgent, NewsAnalystAgent, ResearchSynthesizer
+from app.services.agents import AgentFailure, DocumentRagAgent, MarketAnalystAgent, NewsAnalystAgent, ResearchSynthesizer
 from app.services.rag_service import RagService
 from app.services.research_orchestrator import ResearchOrchestrator
 from app.services.research_service import ResearchService
@@ -20,7 +21,7 @@ def make_orchestrator(llm=None):
     return ResearchOrchestrator(ResearchService(provider, provider), RagService(llm), MarketAnalystAgent(llm), NewsAnalystAgent(llm), DocumentRagAgent(llm), ResearchSynthesizer(llm))
 
 
-def test_research_request_runs_agents_and_persists_tenant_scoped_result(client):
+def test_complete_research_orchestration_succeeds_with_valid_market_analyst_json(client):
     account = signup(client)
     client.app.dependency_overrides[get_orchestrator] = make_orchestrator
     response = client.post("/api/v1/research", json={"ticker": "NVDA", "question": "Analyze the company's recent performance and major risks."}, headers=auth_headers(account["access_token"]))
@@ -107,6 +108,25 @@ def test_required_news_provider_failure_still_fails_research_job(client):
 def test_analysis_rejects_claim_with_unknown_evidence():
     with pytest.raises(ValueError):
         MarketAnalysis(summary="test", metrics={}, signals=[{"claim": "unsupported", "evidence": [Evidence(source_type="MARKET", source_id="wrong", snippet="wrong").model_dump()]}], evidence=[])
+
+
+def test_market_agent_valid_json_parses_to_market_analysis():
+    class ValidLLM:
+        async def complete_json(self, *args, **kwargs):
+            return {"agent": "market_analyst", "summary": "valid", "metrics": {"start_close": 100.0}, "signals": [], "evidence": []}
+
+    result = asyncio.run(MarketAnalystAgent(ValidLLM())._complete(MarketAnalysis, "prompt", {}))
+    assert result == MarketAnalysis(summary="valid", metrics={"start_close": 100.0}, signals=[], evidence=[])
+
+
+def test_market_agent_schema_invalid_json_has_clear_validation_error():
+    class SchemaInvalidLLM:
+        async def complete_json(self, *args, **kwargs):
+            return {"agent": "market_analyst", "summary": "valid", "metrics": "not an object", "signals": [], "evidence": []}
+
+    with pytest.raises(AgentFailure, match="invalid fields: metrics") as error:
+        asyncio.run(MarketAnalystAgent(SchemaInvalidLLM())._complete(MarketAnalysis, "prompt", {}))
+    assert error.value.category == "llm_invalid_response"
 
 
 def test_research_and_reports_are_paginated_and_tenant_scoped(client):

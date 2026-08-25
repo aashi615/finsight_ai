@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timezone
+from pydantic import ValidationError
 from app.llm.base import LLMProvider, LLMProviderError
 from app.models.document import DocumentChunk
 from app.prompts import document, market, news, synthesis
@@ -15,8 +16,10 @@ class AgentFailure(Exception):
 def _validate(model, payload):
     try:
         return model.model_validate(payload)
-    except Exception as exc:
-        raise AgentFailure("LLM returned invalid structured analysis.", category="llm_invalid_response") from exc
+    except ValidationError as exc:
+        locations = [".".join(str(part) for part in error["loc"]) for error in exc.errors()[:3]]
+        detail = ", ".join(locations) or "unknown field"
+        raise AgentFailure(f"LLM returned invalid structured analysis (invalid fields: {detail}).", category="llm_invalid_response") from exc
 
 
 def _only_supplied_evidence(result, supplied: list[Evidence]):

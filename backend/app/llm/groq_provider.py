@@ -37,7 +37,18 @@ class GroqProvider:
         with self._request_limiter:
             for attempt in range(self._max_attempts):
                 try:
-                    response = self.client.chat.completions.create(model=settings.llm_model, messages=[{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, default=str)}], response_format={"type": "json_object"}, max_tokens=max_output_tokens, temperature=0.2)
+                    request = {
+                        "model": settings.llm_model,
+                        "messages": self._messages(prompt, payload, agent),
+                        "response_format": {"type": "json_object"},
+                        "max_tokens": max_output_tokens,
+                        "temperature": 0.2,
+                    }
+                    # GPT-OSS defaults to raw reasoning. Groq requires hidden or parsed
+                    # reasoning when JSON mode is requested.
+                    if agent == "market_analyst":
+                        request["reasoning_format"] = "hidden"
+                    response = self.client.chat.completions.create(**request)
                     content = response.choices[0].message.content
                     parsed = json.loads(content)
                     if not isinstance(parsed, dict):
@@ -51,11 +62,20 @@ class GroqProvider:
                     category, retryable, retry_after = self._classify_error(exc)
                     self._log_error(agent, attempt + 1, category, exc)
                     if not retryable or attempt == self._max_attempts - 1:
-                        raise LLMProviderError("Groq quota is exhausted." if category == "llm_quota_exhausted" else "Groq provider is temporarily unavailable.", category=category) from exc
+                        message = "Groq quota is exhausted." if category == "llm_quota_exhausted" else "Groq rejected the requested JSON output." if category == "llm_invalid_response" else "Groq provider is temporarily unavailable."
+                        raise LLMProviderError(message, category=category) from exc
                     delay = self._retry_delay(attempt, retry_after)
                     logger.warning("llm_retry", extra={"provider": "groq", "agent": agent, "model": settings.llm_model, "attempt": attempt + 1, "retry_delay_seconds": round(delay, 3), "error_category": category})
                     self._sleep(delay)
         raise AssertionError("unreachable")
+
+    @staticmethod
+    def _messages(prompt: str, payload: dict, agent: str) -> list[dict[str, str]]:
+        payload_json = json.dumps(payload, default=str)
+        if agent == "market_analyst":
+            # Keep the JSON instruction in the user message for GPT-OSS JSON mode.
+            return [{"role": "user", "content": f"{prompt}\n\nInput data:\n{payload_json}"}]
+        return [{"role": "system", "content": prompt}, {"role": "user", "content": payload_json}]
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         return self._embeddings.embed(texts)
@@ -68,6 +88,8 @@ class GroqProvider:
         retry_after = headers.get("retry-after")
         if "insufficient_quota" in error_text or "quota" in error_text or "billing" in error_text:
             return "llm_quota_exhausted", False, retry_after
+        if "json_validate_failed" in error_text or "generated json does not match" in error_text:
+            return "llm_invalid_response", False, retry_after
         if status == 429:
             return "llm_rate_limit", True, retry_after
         if isinstance(status, int) and 500 <= status <= 599:

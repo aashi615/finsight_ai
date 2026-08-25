@@ -13,9 +13,10 @@ def completion(payload=None):
 
 
 class Chat:
-    def __init__(self, outcomes): self.outcomes, self.calls = iter(outcomes), 0
+    def __init__(self, outcomes): self.outcomes, self.calls, self.requests = iter(outcomes), 0, []
     def create(self, **kwargs):
         self.calls += 1
+        self.requests.append(kwargs)
         value = next(self.outcomes)
         if isinstance(value, Exception): raise value
         return value
@@ -36,6 +37,32 @@ def test_groq_provider_uses_configured_model_and_parses_json(monkeypatch):
     provider = GroqProvider(api_key="test", client=fake)
     assert asyncio.run(provider.complete_json("system", {"a": 1}, agent="market_analyst", max_output_tokens=900)) == {"ok": True}
     assert fake.chat.completions.calls == 1
+
+
+def test_groq_market_request_uses_json_mode_hidden_reasoning_and_user_json_prompt():
+    fake = client([completion()])
+    provider = GroqProvider(api_key="test", client=fake)
+    asyncio.run(provider.complete_json("Return ONLY valid JSON.", {"a": 1}, agent="market_analyst", max_output_tokens=900))
+    request = fake.chat.completions.requests[0]
+    assert request["response_format"] == {"type": "json_object"}
+    assert request["reasoning_format"] == "hidden"
+    assert request["messages"] == [{"role": "user", "content": "Return ONLY valid JSON.\n\nInput data:\n{\"a\": 1}"}]
+
+
+def test_groq_malformed_json_is_a_clear_structured_output_error():
+    malformed = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="not json"))])
+    provider = GroqProvider(api_key="test", client=client([malformed]))
+    with pytest.raises(LLMProviderError, match="malformed structured output") as error:
+        asyncio.run(provider.complete_json("prompt", {}, agent="market_analyst", max_output_tokens=900))
+    assert error.value.category == "llm_invalid_response"
+
+
+def test_groq_json_validation_failure_is_categorized_as_invalid_response():
+    rejected = ProviderException(400, {"error": {"type": "invalid_request_error", "code": "json_validate_failed", "message": "Failed to validate JSON"}})
+    provider = GroqProvider(api_key="test", client=client([rejected]))
+    with pytest.raises(LLMProviderError, match="rejected the requested JSON output") as error:
+        asyncio.run(provider.complete_json("prompt", {}, agent="market_analyst", max_output_tokens=900))
+    assert error.value.category == "llm_invalid_response"
 
 
 def test_groq_rate_limit_retries_but_quota_does_not():
