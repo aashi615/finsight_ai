@@ -66,15 +66,21 @@ class ResearchOrchestrator:
         except Exception as exc:
             db.rollback()
             job.status = ResearchJobStatus.FAILED
-            job.error_message = "Historical market data is unavailable from all configured providers." if self._is_market_data_failure(exc) else "Research processing failed."
+            category = getattr(exc, "category", "research_processing")
+            job.error_message = "Historical market data is unavailable from all configured providers." if self._is_market_data_failure(exc) else self._failure_message(category)
             job.completed_at = datetime.now(timezone.utc)
             db.commit()
-            logger.warning("research job failed", extra={"job_id": str(job.id), "company": company.ticker, "duration_seconds": round(time.monotonic() - started, 3), "error_type": type(exc).__name__, "error_category": "research_processing"})
+            logger.warning("research job failed", extra={"job_id": str(job.id), "company": company.ticker, "duration_seconds": round(time.monotonic() - started, 3), "error_type": type(exc).__name__, "error_category": category, "error_detail": str(exc), "cause_type": type(exc.__cause__).__name__ if exc.__cause__ else None})
             return job
 
     @staticmethod
     def _is_market_data_failure(exc: Exception) -> bool:
         return isinstance(exc, HTTPException) and exc.status_code == 503 and isinstance(exc.detail, dict) and exc.detail.get("code") == "PROVIDER_UNAVAILABLE"
+
+    @staticmethod
+    def _failure_message(category: str) -> str:
+        messages = {"llm_quota_exhausted": "Research processing failed: the LLM provider quota is exhausted.", "llm_rate_limit": "Research processing failed: the LLM provider is rate limited.", "llm_timeout": "Research processing failed: the LLM provider timed out.", "llm_invalid_response": "Research processing failed: the LLM returned an invalid structured response.", "llm_provider_error": "Research processing failed: the LLM provider rejected the request."}
+        return messages.get(category, "Research processing failed.")
 
     async def _run_agents(self, db: Session, job: ResearchJob, company) -> ResearchSynthesis:
         # Fetch sync providers off the event loop; yfinance is blocking.
@@ -97,6 +103,6 @@ class ResearchOrchestrator:
             result = await work
             logger.info("research agent completed", extra={"job_id": str(job.id), "company": ticker, "agent": agent_name, "duration_seconds": round(time.monotonic() - started, 3), "success": True})
             return result
-        except Exception:
-            logger.warning("research agent failed", extra={"job_id": str(job.id), "company": ticker, "agent": agent_name, "duration_seconds": round(time.monotonic() - started, 3), "success": False, "error_category": "agent_failure"})
+        except Exception as exc:
+            logger.warning("research agent failed", extra={"job_id": str(job.id), "company": ticker, "agent": agent_name, "duration_seconds": round(time.monotonic() - started, 3), "success": False, "error_type": type(exc).__name__, "error_category": getattr(exc, "category", "agent_failure"), "error_detail": str(exc), "cause_type": type(exc.__cause__).__name__ if exc.__cause__ else None})
             raise

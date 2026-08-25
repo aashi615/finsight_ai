@@ -87,4 +87,6 @@ class GroqProvider:
     def _log_error(self, agent: str, attempt: int, category: str, exc: Exception) -> None:
         response = getattr(exc, "response", None)
         headers = getattr(response, "headers", {}) or {}
-        logger.warning("llm_request_failed", extra={"provider": "groq", "agent": agent, "model": settings.llm_model, "attempt": attempt, "status": getattr(exc, "status_code", None), "request_id": headers.get("x-request-id"), "error_category": category})
+        body = getattr(exc, "body", None)
+        error = body.get("error", body) if isinstance(body, dict) else {}
+        logger.warning("llm_request_failed", extra={"provider": "groq", "agent": agent, "model": settings.llm_model, "attempt": attempt, "status": getattr(exc, "status_code", None), "request_id": headers.get("x-request-id"), "groq_error_type": error.get("type") if isinstance(error, dict) else type(exc).__name__, "groq_error_code": error.get("code") if isinstance(error, dict) else None, "groq_error_message": error.get("message") if isinstance(error, dict) else str(exc), "error_category": category})
