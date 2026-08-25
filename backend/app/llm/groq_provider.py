@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import random
-import re
 import threading
 import time
 from collections.abc import Callable
@@ -23,24 +22,62 @@ class StructuredOutputParseError(ValueError):
         self.stage = stage
 
 
-def extract_json_object(text: str) -> dict:
-    """Safely normalize common wrappers and return exactly one JSON object."""
-    if not isinstance(text, str):
+def normalize_json_response(content: str) -> str:
+    """Extract the first balanced JSON object/array from a model response.
+
+    This is deliberately structural only: JSON syntax is validated by json.loads
+    in the provider immediately after normalization.
+    """
+    if not isinstance(content, str):
         raise StructuredOutputParseError("response_content")
-    normalized = text.strip()
-    fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", normalized, flags=re.DOTALL | re.IGNORECASE)
-    if fence:
-        normalized = fence.group(1).strip()
-    normalized = re.sub(r"^json\s*[:\n]?\s*", "", normalized, count=1, flags=re.IGNORECASE)
-    try:
-        parsed, end = json.JSONDecoder().raw_decode(normalized)
-    except json.JSONDecodeError as exc:
-        raise StructuredOutputParseError("json_decode") from exc
-    if normalized[end:].strip():
-        raise StructuredOutputParseError("trailing_content")
-    if not isinstance(parsed, dict):
-        raise StructuredOutputParseError("json_object")
-    return parsed
+    text = content.strip()
+    if not text:
+        raise StructuredOutputParseError("empty_response")
+
+    for start, character in enumerate(text):
+        if character not in "{[":
+            continue
+        end = _balanced_json_end(text, start)
+        if end is not None:
+            return text[start:end]
+    raise StructuredOutputParseError("json_extraction")
+
+
+def _balanced_json_end(text: str, start: int) -> int | None:
+    """Find a JSON container end while respecting quoted strings and escapes."""
+    opening = text[start]
+    closing = "}" if opening == "{" else "]"
+    stack = [closing]
+    in_string = False
+    escaped = False
+    for index in range(start + 1, len(text)):
+        character = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character == "{":
+            stack.append("}")
+        elif character == "[":
+            stack.append("]")
+        elif character in "}]":
+            if character != stack[-1]:
+                return None
+            stack.pop()
+            if not stack:
+                return index + 1
+    return None
+
+
+def extract_json_object(text: str) -> str:
+    """Backward-compatible alias for the provider JSON normalizer."""
+    return normalize_json_response(text)
 
 
 class GroqProvider:
@@ -64,6 +101,7 @@ class GroqProvider:
         with self._request_limiter:
             for attempt in range(self._max_attempts):
                 request_id = None
+                response_details: dict[str, Any] = {}
                 try:
                     request = {
                         "model": settings.llm_model,
@@ -78,13 +116,19 @@ class GroqProvider:
                     }
                     response = self.client.chat.completions.create(**request)
                     request_id = getattr(response, "_request_id", None)
-                    parsed = self._parse_json_response(response.choices[0].message.content, agent, request_id)
+                    choice = response.choices[0]
+                    message = choice.message
+                    content = getattr(message, "content", None)
+                    response_details = self._response_details(content, choice, message, request_id)
+                    logger.info("groq_response_received", extra={"provider": "groq", "agent": agent, "model": settings.llm_model, **response_details})
+                    parsed = self._parse_json_response(content, agent, request_id, response_details)
                     usage = getattr(response, "usage", None)
                     logger.info("llm_usage", extra={"provider": "groq", "agent": agent, "model": settings.llm_model, "input_tokens": getattr(usage, "prompt_tokens", None), "output_tokens": getattr(usage, "completion_tokens", None), "total_tokens": getattr(usage, "total_tokens", None), "request_id": getattr(response, "_request_id", None)})
                     return parsed
                 except (StructuredOutputParseError, TypeError, KeyError, IndexError) as exc:
                     stage = getattr(exc, "stage", "response_content")
-                    logger.warning("llm_response_parse_failed", extra={"provider": "groq", "agent": agent, "model": settings.llm_model, "request_id": request_id, "response_parsing_stage": stage})
+                    event = {"empty_response": "groq_empty_response", "json_extraction": "groq_json_extraction_failed", "json_decode": "groq_json_decode_failed"}.get(stage, "groq_json_parse_failed")
+                    logger.warning(event, extra={"provider": "groq", "agent": agent, "model": settings.llm_model, "request_id": request_id, "response_parsing_stage": stage, **response_details})
                     raise LLMProviderError(f"Groq returned malformed JSON output at {stage}.", category="llm_invalid_response") from exc
                 except Exception as exc:
                     category, retryable, retry_after = self._classify_error(exc)
@@ -103,10 +147,35 @@ class GroqProvider:
         return [{"role": "user", "content": f"{prompt}\n\nInput data:\n{payload_json}"}]
 
     @staticmethod
-    def _parse_json_response(content: Any, agent: str, request_id: str | None = None) -> dict:
-        parsed = extract_json_object(content)
+    def _parse_json_response(content: Any, agent: str, request_id: str | None = None, response_details: dict[str, Any] | None = None) -> dict:
+        extracted = normalize_json_response(content)
+        logger.info("groq_json_parse_attempt", extra={"provider": "groq", "agent": agent, "model": settings.llm_model, "request_id": request_id, "response_parsing_stage": "before_json_loads", **(response_details or {})})
+        try:
+            parsed = json.loads(extracted)
+        except json.JSONDecodeError as exc:
+            raise StructuredOutputParseError("json_decode") from exc
+        if not isinstance(parsed, dict):
+            raise StructuredOutputParseError("json_object")
         logger.info("llm_response_parsed", extra={"provider": "groq", "agent": agent, "model": settings.llm_model, "request_id": request_id, "response_parsing_stage": "json_loaded"})
         return parsed
+
+    @staticmethod
+    def _response_details(content: Any, choice: Any, message: Any, request_id: str | None) -> dict[str, Any]:
+        preview = content[:1000] if isinstance(content, str) else None
+        return {
+            "status": 200,
+            "request_id": request_id,
+            "finish_reason": getattr(choice, "finish_reason", None),
+            "content_type": type(content).__name__ if content is not None else None,
+            "content_length": len(content) if isinstance(content, str) else None,
+            "content_preview": preview,
+            "content_empty": not bool(content and content.strip()) if isinstance(content, str) else content is None,
+            "reasoning_content_present": bool(getattr(message, "reasoning_content", None)),
+            "content_has_code_fence": "```" in content if isinstance(content, str) else False,
+            "tool_calls_present": bool(getattr(message, "tool_calls", None)),
+            "response_format": "none",
+            "reasoning_format": "hidden",
+        }
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         return self._embeddings.embed(texts)

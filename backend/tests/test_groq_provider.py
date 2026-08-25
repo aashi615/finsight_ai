@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.llm.base import LLMProviderError
-from app.llm.groq_provider import GroqProvider, extract_json_object
+from app.llm.groq_provider import GroqProvider, extract_json_object, normalize_json_response
 
 
 def completion(payload=None):
@@ -52,7 +52,7 @@ def test_groq_market_request_uses_local_json_contract_with_hidden_reasoning():
 def test_groq_malformed_json_is_a_clear_structured_output_error():
     malformed = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="not json"))])
     provider = GroqProvider(api_key="test", client=client([malformed]))
-    with pytest.raises(LLMProviderError, match="malformed JSON output at json_decode") as error:
+    with pytest.raises(LLMProviderError, match="malformed JSON output at json_extraction") as error:
         asyncio.run(provider.complete_json("prompt", {}, agent="market_analyst", max_output_tokens=900))
     assert error.value.category == "llm_invalid_response"
 
@@ -66,7 +66,47 @@ def test_groq_malformed_json_is_a_clear_structured_output_error():
     ],
 )
 def test_groq_extracts_supported_json_wrappers(content, expected):
-    assert extract_json_object(content) == expected
+    assert json.loads(normalize_json_response(content)) == expected
+
+
+def test_groq_extracts_json_surrounded_by_explanatory_text_and_braces_in_strings():
+    content = 'Here is the result: ```json\n{"summary": "A {brace} in a string"}\n``` Thanks.'
+    assert json.loads(extract_json_object(content)) == {"summary": "A {brace} in a string"}
+
+
+@pytest.mark.parametrize("content, stage", [("", "empty_response"), (None, "response_content"), ("Explanation without JSON", "json_extraction")])
+def test_groq_extraction_failures_are_typed(content, stage):
+    with pytest.raises(Exception) as error:
+        extract_json_object(content)
+    assert getattr(error.value, "stage", None) == stage
+
+
+def test_groq_malformed_json_reaches_the_controlled_json_decode_stage():
+    provider = GroqProvider(api_key="test", client=client([]))
+    with pytest.raises(Exception) as error:
+        provider._parse_json_response('{"broken": }', "market_analyst")
+    assert getattr(error.value, "stage", None) == "json_decode"
+
+
+def test_groq_rejects_array_when_an_object_is_required():
+    provider = GroqProvider(api_key="test", client=client([]))
+    with pytest.raises(Exception) as error:
+        provider._parse_json_response('[{"ok": true}]', "market_analyst")
+    assert getattr(error.value, "stage", None) == "json_object"
+
+
+def test_groq_sdk_gpt_oss_message_shape_parses_final_content_not_reasoning():
+    sdk_response = SimpleNamespace(
+        choices=[SimpleNamespace(
+            finish_reason="stop",
+            message=SimpleNamespace(content='{"ok": true}', reasoning_content="internal reasoning", tool_calls=None),
+        )],
+        usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7, total_tokens=18),
+        _request_id="req_gpt_oss",
+    )
+    fake = client([sdk_response])
+    provider = GroqProvider(api_key="test", client=fake)
+    assert asyncio.run(provider.complete_json("prompt", {}, agent="market_analyst", max_output_tokens=900)) == {"ok": True}
 
 
 def test_groq_json_validation_failure_is_categorized_as_invalid_response():

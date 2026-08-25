@@ -16,13 +16,13 @@ class AgentFailure(Exception):
         self.category = category
 
 
-def _validate(model, payload):
+def _validate(model, payload, *, agent: str | None = None):
     try:
         return model.model_validate(payload)
     except ValidationError as exc:
         locations = [".".join(str(part) for part in error["loc"]) for error in exc.errors()[:3]]
         detail = ", ".join(locations) or "unknown field"
-        logger.warning("llm_response_validation_failed", extra={"response_parsing_stage": "pydantic_validation", "validation_failure_fields": detail})
+        logger.warning("groq_schema_validation_failed", extra={"agent": agent, "response_parsing_stage": "pydantic_validation", "validation_failure_fields": detail})
         raise AgentFailure(f"LLM returned invalid structured analysis (invalid fields: {detail}).", category="llm_invalid_response") from exc
 
 
@@ -47,7 +47,7 @@ class MarketAnalystAgent:
         result = await self._complete(MarketAnalysis, market.PROMPT, payload)
         return _only_supplied_evidence(result.model_copy(update={"metrics": metrics}), evidence)
     async def _complete(self, model, prompt, payload):
-        try: return _validate(model, await self.llm.complete_json(prompt, payload, agent="market_analyst", max_output_tokens=900))
+        try: return _validate(model, await self.llm.complete_json(prompt, payload, agent="market_analyst", max_output_tokens=900), agent="market_analyst")
         except LLMProviderError as exc: raise AgentFailure("Market agent failed.", category=exc.category) from exc
 
 
@@ -60,7 +60,7 @@ class NewsAnalystAgent:
             return NewsAnalysis(summary="No recent news is available.", themes=[], signals=[], evidence=[])
         evidence = evidence[:10]
         payload = {"question": context["question"], "articles": [{"title": article.title, "summary": (article.summary or "")[:500], "published_at": article.published_at.isoformat()} for article in articles[:10]], "evidence": [item.model_dump() for item in evidence]}
-        try: return _only_supplied_evidence(_validate(NewsAnalysis, await self.llm.complete_json(news.PROMPT, payload, agent="news_analyst", max_output_tokens=900)), evidence)
+        try: return _only_supplied_evidence(_validate(NewsAnalysis, await self.llm.complete_json(news.PROMPT, payload, agent="news_analyst", max_output_tokens=900), agent="news_analyst"), evidence)
         except LLMProviderError as exc: raise AgentFailure("News agent failed.", category=exc.category) from exc
 
 
@@ -72,7 +72,7 @@ class DocumentRagAgent:
             return DocumentAnalysis(summary="No tenant-owned documents matched this request.", findings=[], evidence=[])
         evidence = evidence[:3]
         payload = {"question": question, "chunks": [{"document_id": str(chunk.document_id), "source": chunk.source_url, "page_number": chunk.page_number, "section": chunk.section, "chunk_index": chunk.chunk_index, "text": chunk.content[:800]} for chunk in chunks[:3]], "evidence": [item.model_dump() for item in evidence]}
-        try: return _only_supplied_evidence(_validate(DocumentAnalysis, await self.llm.complete_json(document.PROMPT, payload, agent="document_rag_agent", max_output_tokens=700)), evidence)
+        try: return _only_supplied_evidence(_validate(DocumentAnalysis, await self.llm.complete_json(document.PROMPT, payload, agent="document_rag_agent", max_output_tokens=700), agent="document_rag_agent"), evidence)
         except LLMProviderError as exc: raise AgentFailure("Document agent failed.", category=exc.category) from exc
 
 
@@ -84,7 +84,7 @@ class ResearchSynthesizer:
             raise AgentFailure("Research cannot be synthesized without evidence.")
         supplied_evidence = [*market_analysis.evidence, *news_analysis.evidence, *document_analysis.evidence]
         payload = {"company": {"ticker": company.ticker, "name": company.name}, "market": market_analysis.model_dump(), "news": news_analysis.model_dump(), "documents": document_analysis.model_dump(), "allowed_evidence": [item.model_dump() for item in supplied_evidence]}
-        try: result = _validate(ResearchSynthesis, await self.llm.complete_json(synthesis.PROMPT, payload, agent="research_synthesizer", max_output_tokens=1500))
+        try: result = _validate(ResearchSynthesis, await self.llm.complete_json(synthesis.PROMPT, payload, agent="research_synthesizer", max_output_tokens=1500), agent="research_synthesizer")
         except LLMProviderError as exc: raise AgentFailure("Synthesizer failed.", category=exc.category) from exc
         returned = {evidence_identity(item) for item in result.evidence}
         if not returned.issubset(allowed):
