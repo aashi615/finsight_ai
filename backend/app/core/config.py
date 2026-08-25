@@ -19,6 +19,25 @@ class Settings(BaseSettings):
     llm_provider: Literal["groq", "openai"] = "groq"
     groq_api_key: str | None = None
     llm_model: str = "openai/gpt-oss-120b"
+    groq_research_model: str = "openai/gpt-oss-20b"
+    groq_final_model: str = "openai/gpt-oss-120b"
+    max_llm_concurrency: int = 2
+    # LLM budgets are deliberately conservative: Groq TPM includes prompt and
+    # completion tokens, so these limits are part of the production contract.
+    news_max_output_tokens: int = 700
+    market_max_output_tokens: int = 700
+    rag_max_output_tokens: int = 700
+    final_max_output_tokens: int = 1200
+    groq_tpm_limit: int = 8000
+    groq_safe_tpm_limit: int = 7000
+    max_llm_retries: int = 2
+    research_agent_input_token_limit: int = 1800
+    final_agent_input_token_limit: int = 1800
+    news_article_limit: int = 6
+    news_article_snippet_chars: int = 280
+    market_history_points_limit: int = 12
+    rag_top_k: int = 3
+    rag_chunk_chars: int = 600
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
     frontend_url: str | None = "http://localhost:5173"
     max_request_body_bytes: int = 1_000_000

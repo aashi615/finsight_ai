@@ -8,7 +8,7 @@ import pytest
 from app.api.v1.research import get_orchestrator
 from app.core.database import get_db
 from app.providers.base import ProviderError
-from app.schemas.research import Evidence, MarketAnalysis, NewsAnalysis
+from app.schemas.research import DocumentAnalysis, Evidence, MarketAnalysis, NewsAnalysis
 from app.services.agents import AgentFailure, DocumentRagAgent, MarketAnalystAgent, NewsAnalystAgent, ResearchSynthesizer
 from app.services.rag_service import RagService
 from app.services.research_orchestrator import ResearchOrchestrator
@@ -151,6 +151,34 @@ def test_market_agent_fails_when_the_provider_reports_two_incomplete_attempts():
     with pytest.raises(AgentFailure, match="Market agent failed") as error:
         asyncio.run(MarketAnalystAgent(IncompleteLLM())._complete(MarketAnalysis, "prompt", {}))
     assert error.value.category == "llm_incomplete_response"
+
+
+def test_final_synthesis_receives_only_independent_compact_summaries():
+    class CapturingLLM:
+        payload = None
+        async def complete_json(self, prompt, payload, **kwargs):
+            self.payload = payload
+            evidence = [item for summary in payload.values() if summary for item in summary["evidence"]]
+            return {"executive_summary": "Based on available data.", "company_overview": "Available data.", "market_analysis": "Available data.", "news_analysis": "Available data.", "key_risks": [], "key_opportunities": [], "evidence": evidence, "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
+
+    evidence = Evidence(source_type="NEWS", source_id="n1", snippet="compact", url="https://example.test")
+    llm = CapturingLLM()
+    result = asyncio.run(ResearchSynthesizer(llm).synthesize(None, NewsAnalysis(summary="news", themes=[], signals=[], evidence=[evidence]), DocumentAnalysis(summary="rag", findings=[], evidence=[])))
+    assert result.confidence == 0.5
+    assert set(llm.payload) == {"news_summary", "market_summary", "rag_summary"}
+    assert llm.payload["market_summary"] is None
+    assert "articles" not in str(llm.payload) and "chunks" not in str(llm.payload)
+
+
+def test_partial_agent_failure_preserves_successful_summary():
+    orchestrator = make_orchestrator()
+    async def successful():
+        return "news summary"
+    async def failed():
+        raise AgentFailure("market unavailable")
+    job = SimpleNamespace(id="job")
+    assert asyncio.run(orchestrator._run_branch(job, "NVDA", "news_analyst", successful())) == "news summary"
+    assert asyncio.run(orchestrator._run_branch(job, "NVDA", "market_analyst", failed())) is None
 
 
 def test_research_and_reports_are_paginated_and_tenant_scoped(client):

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.llm.base import LLMProviderError
-from app.llm.groq_provider import GroqProvider, extract_json_object, normalize_json_response
+from app.llm.groq_provider import GroqProvider, TokenBudgetManager, extract_json_object, normalize_json_response
 
 
 def completion(payload=None, *, finish_reason="stop", output_tokens=7):
@@ -169,3 +169,32 @@ def test_groq_local_embeddings_do_not_require_external_api():
     vector = provider.embed(["NVIDIA earnings growth"])[0]
     assert len(vector) == 256
     assert any(vector)
+
+
+def test_groq_enforces_agent_output_budgets():
+    fake = client([completion(), completion(), completion(), completion()])
+    provider = GroqProvider(api_key="test", client=fake, token_budget=TokenBudgetManager(7000))
+    for agent, requested, expected in [
+        ("news_analyst", 4096, 700),
+        ("market_analyst", 4913, 700),
+        ("document_rag_agent", 900, 700),
+        ("research_synthesizer", 5000, 1200),
+    ]:
+        asyncio.run(provider.complete_json("prompt", {}, agent=agent, max_output_tokens=requested))
+        assert fake.chat.completions.requests[-1]["max_completion_tokens"] == expected
+
+
+def test_tpm_guard_delays_when_request_would_exceed_safe_limit():
+    budget = TokenBudgetManager(7000)
+    assert budget.reserve_or_delay(6500) == 0
+    assert budget.reserve_or_delay(1200) > 0
+
+
+def test_token_429_respects_retry_after_and_max_retry_count():
+    limited = ProviderException(429, {"error": {"type": "tokens", "code": "rate_limit_exceeded"}})
+    limited.response.headers = {"retry-after": "3"}
+    fake = client([limited, completion()])
+    delays = []
+    provider = GroqProvider(api_key="test", client=fake, sleep=delays.append, random_value=lambda: 0, token_budget=TokenBudgetManager(7000))
+    assert asyncio.run(provider.complete_json("prompt", {}, agent="news_analyst", max_output_tokens=700)) == {"ok": True}
+    assert delays == [3] and fake.chat.completions.calls == 2
