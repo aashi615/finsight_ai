@@ -75,7 +75,7 @@ def test_groq_market_request_uses_supported_low_reasoning_configuration():
 
 def test_groq_malformed_json_is_a_clear_structured_output_error():
     malformed = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="not json"))])
-    provider = GroqProvider(api_key="test", client=client([malformed]))
+    provider = GroqProvider(api_key="test", client=client([malformed, malformed, malformed]))
     with pytest.raises(LLMProviderError, match="malformed JSON output at json_extraction") as error:
         asyncio.run(provider.complete_json("prompt", {}, agent="market_analyst", max_output_tokens=900))
     assert error.value.category == "llm_invalid_response"
@@ -177,9 +177,9 @@ def test_groq_enforces_agent_output_budgets():
     fake = client([completion(), completion(), completion(), completion()])
     provider = GroqProvider(api_key="test", client=fake, token_budget=TokenBudgetManager(7000))
     for agent, requested, expected in [
-        ("news_analyst", 4096, 1000),
-        ("market_analyst", 4913, 1000),
-        ("document_rag_agent", 2000, 1000),
+        ("news_analyst", 4096, 800),
+        ("market_analyst", 4913, 900),
+        ("document_rag_agent", 2000, 800),
         ("research_synthesizer", 5000, 1000),
     ]:
         asyncio.run(provider.complete_json("prompt", {}, agent=agent, max_output_tokens=requested))

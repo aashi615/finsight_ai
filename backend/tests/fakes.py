@@ -18,7 +18,7 @@ class FakeLLMProvider:
             raise LLMProviderError("fake provider failure")
         return [[float(len(text)), float(sum(map(ord, text)) % 97), 1.0] for text in texts]
 
-    async def complete_json(self, prompt: str, payload: dict, *, agent: str, max_output_tokens: int) -> dict:
+    async def complete_json(self, prompt: str, payload: dict, *, agent: str, max_output_tokens: int, force_fallback: bool = False) -> dict:
         if self.fail:
             raise LLMProviderError("fake provider failure")
         self.calls.append(prompt)

@@ -42,7 +42,7 @@ class OpenAIProvider:
         self._sleep = sleep
         self._random_value = random_value
 
-    async def complete_json(self, prompt: str, payload: dict, *, agent: str, max_output_tokens: int) -> dict:
+    async def complete_json(self, prompt: str, payload: dict, *, agent: str, max_output_tokens: int, force_fallback: bool = False) -> dict:
         return await asyncio.to_thread(self._complete_json, prompt, payload, agent, max_output_tokens)
 
     def _complete_json(self, prompt: str, payload: dict, agent: str, max_output_tokens: int) -> dict:

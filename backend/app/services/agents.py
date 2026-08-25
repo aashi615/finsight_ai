@@ -37,6 +37,21 @@ def _only_supplied_evidence(result, supplied: list[Evidence]):
     return result
 
 
+async def _complete_validated(llm: LLMProvider, model, prompt: str, payload: dict, *, agent: str, max_output_tokens: int):
+    """Use the provider fallback once when local schema validation rejects GPT-OSS."""
+    try:
+        response = await llm.complete_json(prompt, payload, agent=agent, max_output_tokens=max_output_tokens)
+        return _validate(model, response, agent=agent)
+    except AgentFailure:
+        if agent == "research_synthesizer":
+            raise
+        try:
+            response = await llm.complete_json(prompt, payload, agent=agent, max_output_tokens=max_output_tokens, force_fallback=True)
+            return _validate(model, response, agent=agent)
+        except LLMProviderError:
+            raise
+
+
 class MarketAnalystAgent:
     def __init__(self, llm: LLMProvider): self.llm = llm
     async def analyze(self, context: dict) -> MarketAnalysis:
@@ -53,7 +68,7 @@ class MarketAnalystAgent:
         result = await self._complete(MarketAnalysis, market.PROMPT, payload)
         return _only_supplied_evidence(result.model_copy(update={"metrics": metrics}), evidence)
     async def _complete(self, model, prompt, payload):
-        try: return _validate(model, await self.llm.complete_json(prompt, payload, agent="market_analyst", max_output_tokens=settings.market_max_output_tokens), agent="market_analyst")
+        try: return await _complete_validated(self.llm, model, prompt, payload, agent="market_analyst", max_output_tokens=settings.market_max_output_tokens)
         except LLMProviderError as exc: raise AgentFailure("Market agent failed.", category=exc.category) from exc
 
 
@@ -66,7 +81,7 @@ class NewsAnalystAgent:
             return NewsAnalysis(summary="No recent news is available.", themes=[], signals=[], evidence=[])
         evidence = evidence[:settings.news_article_limit]
         payload = {"question": context["question"][:500], "articles": [{"source_id": str(article.id), "title": article.title[:180], "summary": (article.summary or "")[:settings.news_article_snippet_chars], "published_at": article.published_at.date().isoformat()} for article in articles[:settings.news_article_limit]], "evidence": [item.model_dump() for item in evidence]}
-        try: return _only_supplied_evidence(_validate(NewsAnalysis, await self.llm.complete_json(news.PROMPT, payload, agent="news_analyst", max_output_tokens=settings.news_max_output_tokens), agent="news_analyst"), evidence)
+        try: return _only_supplied_evidence(await _complete_validated(self.llm, NewsAnalysis, news.PROMPT, payload, agent="news_analyst", max_output_tokens=settings.news_max_output_tokens), evidence)
         except LLMProviderError as exc: raise AgentFailure("News agent failed.", category=exc.category) from exc
 
 
@@ -79,7 +94,7 @@ class DocumentRagAgent:
             return DocumentAnalysis(summary="No tenant-owned documents matched this request.", findings=[], evidence=[])
         evidence = evidence[:settings.rag_top_k]
         payload = {"question": question[:500], "chunks": [{"document_id": str(chunk.document_id), "source": chunk.source_url, "page_number": chunk.page_number, "section": chunk.section, "text": chunk.content[:settings.rag_chunk_chars]} for chunk in chunks], "evidence": [item.model_dump() for item in evidence]}
-        try: return _only_supplied_evidence(_validate(DocumentAnalysis, await self.llm.complete_json(document.PROMPT, payload, agent="document_rag_agent", max_output_tokens=settings.rag_max_output_tokens), agent="document_rag_agent"), evidence)
+        try: return _only_supplied_evidence(await _complete_validated(self.llm, DocumentAnalysis, document.PROMPT, payload, agent="document_rag_agent", max_output_tokens=settings.rag_max_output_tokens), evidence)
         except LLMProviderError as exc: raise AgentFailure("Document agent failed.", category=exc.category) from exc
 
 
@@ -93,7 +108,7 @@ class ResearchSynthesizer:
         # This is intentionally the final boundary: no raw API or document data
         # is allowed beyond the three compact, independently-produced summaries.
         payload = {"news_summary": news_analysis.model_dump() if news_analysis else None, "market_summary": market_analysis.model_dump() if market_analysis else None, "rag_summary": document_analysis.model_dump() if document_analysis else None}
-        try: result = _validate(ResearchSynthesis, await self.llm.complete_json(synthesis.PROMPT, payload, agent="research_synthesizer", max_output_tokens=settings.final_max_output_tokens), agent="research_synthesizer")
+        try: result = await _complete_validated(self.llm, ResearchSynthesis, synthesis.PROMPT, payload, agent="research_synthesizer", max_output_tokens=settings.final_max_output_tokens)
         except LLMProviderError as exc: raise AgentFailure("Synthesizer failed.", category=exc.category) from exc
         returned = {evidence_identity(item) for item in result.evidence}
         if not returned.issubset(allowed):
