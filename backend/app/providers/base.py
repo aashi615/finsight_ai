@@ -7,6 +7,10 @@ from typing import Protocol
 class ProviderError(Exception):
     """A provider failed without exposing implementation details to API clients."""
 
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class UnknownTickerError(ProviderError):
     pass

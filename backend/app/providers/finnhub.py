@@ -20,6 +20,8 @@ class FinnhubProvider:
             response = httpx.get(f"{self.base_url}{path}", params={**params, "token": self.api_key}, timeout=10.0)
             response.raise_for_status()
             return response.json()
+        except httpx.HTTPStatusError as exc:
+            raise ProviderError("Provider is unavailable or returned malformed data.", status_code=exc.response.status_code) from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise ProviderError("Provider is unavailable or returned malformed data.") from exc
 

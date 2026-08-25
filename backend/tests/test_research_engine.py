@@ -4,6 +4,7 @@ import pytest
 
 from app.api.v1.research import get_orchestrator
 from app.core.database import get_db
+from app.providers.base import ProviderError
 from app.schemas.research import Evidence, MarketAnalysis
 from app.services.agents import DocumentRagAgent, MarketAnalystAgent, NewsAnalystAgent, ResearchSynthesizer
 from app.services.rag_service import RagService
@@ -69,6 +70,44 @@ def test_provider_failure_is_controlled_and_job_fails(client):
     client.app.dependency_overrides[get_orchestrator] = lambda: make_orchestrator(FakeLLMProvider(fail=True))
     response = client.post("/api/v1/research", json={"ticker": "NVDA", "question": "Analyze the company's recent performance and major risks."}, headers=auth_headers(account["access_token"]))
     assert response.status_code == 200
+    job_id = response.json()["data"]["id"]
+    assert client.get(f"/api/v1/research/{job_id}", headers=auth_headers(account["access_token"])).json()["data"]["status"] == "FAILED"
+
+
+def test_forbidden_historical_market_data_is_optional_and_never_logs_api_key(client, caplog):
+    class CandleForbiddenProvider(FakeResearchProvider):
+        def get_market_data(self, ticker, from_date, to_date):
+            raise ProviderError("forbidden", status_code=403)
+
+    provider = CandleForbiddenProvider()
+    llm = FakeLLMProvider()
+    client.app.dependency_overrides[get_orchestrator] = lambda: ResearchOrchestrator(ResearchService(provider, provider), RagService(llm), MarketAnalystAgent(llm), NewsAnalystAgent(llm), DocumentRagAgent(llm), ResearchSynthesizer(llm))
+    account = signup(client)
+    response = client.post("/api/v1/research", json={"ticker": "NVDA", "question": "Analyze the company's recent performance and major risks."}, headers=auth_headers(account["access_token"]))
+    assert response.status_code == 200
+    job_id = response.json()["data"]["id"]
+    completed = client.get(f"/api/v1/research/{job_id}", headers=auth_headers(account["access_token"])).json()["data"]
+    assert completed["status"] == "COMPLETED"
+    assert "Historical market-price data is unavailable" in completed["result"]["market_analysis"]
+    assert len(llm.calls) == 2  # News analysis and synthesis still run; no candles are fabricated.
+    warning = next(record for record in caplog.records if record.getMessage() == "Historical market data unavailable; continuing research")
+    assert warning.job_id == job_id
+    assert warning.company == "NVDA"
+    assert warning.provider == "finnhub"
+    assert warning.provider_status_code == 403
+    assert "forbidden" not in caplog.text
+    assert "token" not in caplog.text.lower()
+
+
+def test_required_news_provider_failure_still_fails_research_job(client):
+    class NewsUnavailableProvider(FakeResearchProvider):
+        def get_news(self, ticker, from_date, to_date):
+            raise ProviderError("down")
+
+    provider = NewsUnavailableProvider()
+    client.app.dependency_overrides[get_orchestrator] = lambda: ResearchOrchestrator(ResearchService(provider, provider), RagService(FakeLLMProvider()), MarketAnalystAgent(FakeLLMProvider()), NewsAnalystAgent(FakeLLMProvider()), DocumentRagAgent(FakeLLMProvider()), ResearchSynthesizer(FakeLLMProvider()))
+    account = signup(client)
+    response = client.post("/api/v1/research", json={"ticker": "NVDA", "question": "Analyze the company's recent performance and major risks."}, headers=auth_headers(account["access_token"]))
     job_id = response.json()["data"]["id"]
     assert client.get(f"/api/v1/research/{job_id}", headers=auth_headers(account["access_token"])).json()["data"]["status"] == "FAILED"
 

@@ -32,7 +32,9 @@ class FakeLLMProvider:
             return {"agent": "news_analyst", "summary": "Recent news was reviewed.", "themes": ["company update"], "signals": claim, "evidence": evidence}
         if "document analyst" in prompt:
             return {"agent": "document_rag_agent", "summary": "Relevant tenant documents were reviewed.", "findings": claim, "evidence": evidence}
-        return {"executive_summary": "Based on available data, the evidence indicates monitored developments.", "company_overview": "Company overview is based on available data.", "market_analysis": "Market data suggests recent movement.", "news_analysis": "News coverage indicates recent themes.", "key_risks": claim, "key_opportunities": claim, "evidence": evidence, "confidence": 0.6, "generated_at": datetime.now(timezone.utc).isoformat()}
+        market_summary = payload.get("market", {}).get("summary", "")
+        market_analysis = "Historical market-price data is unavailable; no historical price performance was assessed." if "Historical market-price data is unavailable" in market_summary else "Market data suggests recent movement."
+        return {"executive_summary": "Based on available data, the evidence indicates monitored developments.", "company_overview": "Company overview is based on available data.", "market_analysis": market_analysis, "news_analysis": "News coverage indicates recent themes.", "key_risks": claim, "key_opportunities": claim, "evidence": evidence, "confidence": 0.6, "generated_at": datetime.now(timezone.utc).isoformat()}
 
 
 class FakeResearchProvider:

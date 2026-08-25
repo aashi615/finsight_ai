@@ -31,7 +31,7 @@ class MarketAnalystAgent:
         rows = context["market"]
         evidence = [Evidence(source_type="MARKET", source_id=str(row.id), snippet=f"{row.timestamp.date()}: close {row.close}") for row in rows]
         if not rows:
-            return MarketAnalysis(summary="No recent market data is available.", metrics={}, signals=[], evidence=[])
+            return MarketAnalysis(summary="Historical market-price data is unavailable from the configured provider. Do not infer or fabricate historical price performance.", metrics={}, signals=[], evidence=[])
         closes = [float(row.close) for row in rows]
         metrics = {"start_close": closes[0], "end_close": closes[-1], "price_change": closes[-1] - closes[0], "price_change_percent": ((closes[-1] - closes[0]) / closes[0] * 100) if closes[0] else 0.0, "high_close": max(closes), "low_close": min(closes)}
         payload = {"question": context["question"], "market": [{"timestamp": row.timestamp.isoformat(), "open": str(row.open), "high": str(row.high), "low": str(row.low), "close": str(row.close), "volume": row.volume} for row in rows], "calculated_metrics": metrics, "evidence": [item.model_dump() for item in evidence]}

@@ -58,8 +58,8 @@ class ResearchService:
             return company, cached
         try:
             bars = self.market_provider.get_market_data(company.ticker, from_date, to_date)
-        except ProviderError:
-            raise api_error(503, "PROVIDER_UNAVAILABLE", "Market data provider is unavailable.")
+        except ProviderError as exc:
+            raise api_error(503, "PROVIDER_UNAVAILABLE", "Market data provider is unavailable.") from exc
         self._persist_market_data(db, company, bars)
         return company, self.market_data.list_for_range(db, company.id, from_date, to_date)
 

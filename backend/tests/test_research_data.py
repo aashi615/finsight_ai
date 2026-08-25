@@ -1,10 +1,12 @@
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from fastapi import HTTPException
+import httpx
 import pytest
 from app.core.database import get_db
 from app.api.v1.companies import get_research_service
 from app.providers.base import CompanyData, MarketBarData, NewsArticleData, ProviderError
+from app.providers.finnhub import FinnhubProvider
 from app.services.research_service import ResearchService
 from .conftest import auth_headers, signup
 
@@ -77,6 +79,22 @@ def test_invalid_market_date_range_and_provider_failure_are_clean(client):
         service.get_market_data(db, "NVDA", date(2026, 1, 1), date(2026, 1, 3))
     assert failure.value.status_code == 503
     assert failure.value.detail["code"] == "PROVIDER_UNAVAILABLE"
+
+
+def test_finnhub_candle_403_retains_status_without_exposing_the_api_key(monkeypatch):
+    api_key = "do-not-log-this-key"
+
+    def forbidden_get(url, *, params, timeout):
+        request = httpx.Request("GET", url, params=params)
+        response = httpx.Response(403, request=request, json={"error": "You don't have access to this resource."})
+        response.raise_for_status()
+
+    monkeypatch.setattr(httpx, "get", forbidden_get)
+    provider = FinnhubProvider(api_key=api_key, base_url="https://finnhub.test/api/v1")
+    with pytest.raises(ProviderError) as failure:
+        provider.get_market_data("NVDA", date(2026, 1, 1), date(2026, 1, 3))
+    assert failure.value.status_code == 403
+    assert api_key not in str(failure.value)
 
 
 def test_news_is_normalized_deduplicated_and_persisted(client):
