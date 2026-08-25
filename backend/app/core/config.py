@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_model: str = "gpt-4o-mini"
     openai_embedding_model: str = "text-embedding-3-small"
+    llm_provider: Literal["groq", "openai"] = "groq"
+    groq_api_key: str | None = None
+    llm_model: str = "openai/gpt-oss-120b"
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
     frontend_url: str | None = "http://localhost:5173"
     max_request_body_bytes: int = 1_000_000
@@ -47,6 +50,8 @@ class Settings(BaseSettings):
                 raise ValueError("Production requires a PostgreSQL DATABASE_URL.")
             if not self.cors_origins or "*" in self.cors_origins:
                 raise ValueError("Production requires explicit CORS_ORIGINS.")
+            if self.llm_provider == "groq" and not self.groq_api_key:
+                raise ValueError("Production requires GROQ_API_KEY when LLM_PROVIDER=groq.")
         return self
 
 

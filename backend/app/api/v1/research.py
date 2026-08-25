@@ -5,7 +5,7 @@ from app.api.deps import get_current_user, require_role
 from app.core.database import get_db
 from app.core.rate_limit import limit_research
 from app.core.exceptions import api_error
-from app.llm.openai_provider import OpenAIProvider
+from app.llm import get_llm_provider
 from app.models.user import User
 from app.models.user import Role
 from app.providers.finnhub import FinnhubProvider
@@ -26,7 +26,7 @@ reports = ResearchReportRepository()
 
 
 def get_orchestrator() -> ResearchOrchestrator:
-    llm = OpenAIProvider()
+    llm = get_llm_provider()
     finnhub = FinnhubProvider()
     market_provider = FallbackMarketDataProvider(finnhub, YahooFinanceProvider())
     return ResearchOrchestrator(ResearchService(market_provider, finnhub), RagService(llm), MarketAnalystAgent(llm), NewsAnalystAgent(llm), DocumentRagAgent(llm), ResearchSynthesizer(llm))

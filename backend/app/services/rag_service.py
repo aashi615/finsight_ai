@@ -1,4 +1,5 @@
 import io
+import re
 from uuid import UUID
 from urllib.parse import urlsplit
 import faiss
@@ -68,7 +69,10 @@ class RagService:
         matrix = np.asarray([chunk.embedding for chunk in chunks], dtype="float32")
         query_matrix = np.asarray([vector], dtype="float32")
         if matrix.ndim != 2 or query_matrix.shape[1] != matrix.shape[1]:
-            raise api_error(502, "MALFORMED_LLM_OUTPUT", "Embedding dimensions are invalid.")
+            # Existing documents may have been embedded by a retired external
+            # provider. Keep those documents usable after provider migration.
+            terms = set(re.findall(r"[a-z0-9]{2,}", query.lower()))
+            return sorted(chunks, key=lambda chunk: len(terms & set(re.findall(r"[a-z0-9]{2,}", chunk.content.lower()))), reverse=True)[:limit]
         faiss.normalize_L2(matrix)
         faiss.normalize_L2(query_matrix)
         index = faiss.IndexFlatIP(matrix.shape[1])

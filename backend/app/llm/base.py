@@ -2,7 +2,9 @@ from typing import Protocol
 
 
 class LLMProviderError(Exception):
-    pass
+    def __init__(self, message: str, *, category: str = "llm_provider_error"):
+        super().__init__(message)
+        self.category = category
 
 
 class LLMProvider(Protocol):

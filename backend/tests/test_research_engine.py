@@ -134,3 +134,9 @@ def test_admin_can_delete_only_its_organization_research_history(client):
     assert deleted.json()["data"]["deleted_jobs"] == 1
     assert client.get("/api/v1/research", headers=auth_headers(first["access_token"])).json()["data"]["total"] == 0
     assert client.get("/api/v1/research", headers=auth_headers(second["access_token"])).json()["data"]["total"] == 1
+
+
+def test_delete_research_history_cors_preflight_allows_delete(client):
+    response = client.options("/api/v1/research", headers={"Origin": "http://localhost:5173", "Access-Control-Request-Method": "DELETE"})
+    assert response.status_code == 200
+    assert "DELETE" in response.headers["access-control-allow-methods"]

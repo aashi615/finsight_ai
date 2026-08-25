@@ -38,7 +38,7 @@ The frontend uses `VITE_API_URL` at build time. Its localhost fallback is develo
 
 ## Environment variables
 
-See `.env.example` for descriptions. Required production values are `ENVIRONMENT=production`, `DEBUG=false`, PostgreSQL `DATABASE_URL`, a unique 32+ character `JWT_SECRET_KEY`, explicit JSON `CORS_ORIGINS`, `FRONTEND_URL`, `FINNHUB_API_KEY`, and `OPENAI_API_KEY`. Never commit `.env`, database passwords, JWTs, or provider keys.
+See `.env.example` for descriptions. Required production values are `ENVIRONMENT=production`, `DEBUG=false`, PostgreSQL `DATABASE_URL`, a unique 32+ character `JWT_SECRET_KEY`, explicit JSON `CORS_ORIGINS`, `FRONTEND_URL`, `FINNHUB_API_KEY`, and `GROQ_API_KEY`. Set `LLM_PROVIDER=groq` and `LLM_MODEL=openai/gpt-oss-120b`. Never commit `.env`, database passwords, JWTs, or provider keys.
 
 ## Tests and build
 
