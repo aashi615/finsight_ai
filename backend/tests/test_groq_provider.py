@@ -184,10 +184,10 @@ def test_groq_enforces_agent_output_budgets():
     fake = client([completion(), completion(), completion(), completion()])
     provider = GroqProvider(api_key="test", client=fake, token_budget=TokenBudgetManager(7000))
     for agent, requested, expected in [
-        ("news_analyst", 4096, 800),
-        ("market_analyst", 4913, 900),
-        ("document_rag_agent", 2000, 800),
-        ("research_synthesizer", 9000, 1600),
+        ("news_analyst", 4096, 1600),
+        ("market_analyst", 4913, 1400),
+        ("document_rag_agent", 2000, 1200),
+        ("research_synthesizer", 9000, 1200),
     ]:
         asyncio.run(provider.complete_json("prompt", {}, agent=agent, max_output_tokens=requested))
         assert fake.chat.completions.requests[-1]["max_completion_tokens"] == expected
@@ -241,7 +241,42 @@ def test_request_uses_current_available_output_budget_instead_of_waiting_for_con
     asyncio.run(provider.complete_json("prompt", {}, agent="research_synthesizer", max_output_tokens=1600))
     request = fake.chat.completions.requests[0]
     input_tokens = provider._messages("prompt", {}, settings.final_agent_input_token_limit)[1]
-    assert request["max_completion_tokens"] == 1300 - input_tokens
+    assert request["max_completion_tokens"] == min(1200, 1300 - input_tokens)
+
+
+def test_news_length_retry_keeps_the_initial_calculated_output_cap():
+    prompt, payload = "prompt", {}
+    probe = GroqProvider(api_key="test", client=client([]), token_budget=TokenBudgetManager(7000))
+    input_tokens = probe._messages(prompt, payload, settings.research_agent_input_token_limit)[1]
+    now = [0.0]
+    budget = TokenBudgetManager(7000, clock=lambda: now[0])
+    # Leave exactly enough available capacity for this input plus 300 output.
+    assert budget.reserve_or_delay(7000 - input_tokens - 300) == 0
+    fake = client([
+        completion({"partial": True}, finish_reason="length", output_tokens=300),
+        completion({"ok": True}),
+    ])
+    provider = GroqProvider(api_key="test", client=fake, token_budget=budget, sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
+    assert asyncio.run(provider.complete_json(prompt, payload, agent="news_analyst", max_output_tokens=800)) == {"ok": True}
+    assert [request["max_completion_tokens"] for request in fake.chat.completions.requests] == [300, 300]
+
+
+def test_truncated_news_json_uses_a_bounded_compact_retry_and_fallback():
+    prompt, payload = "prompt", {"articles": ["x" * 200]}
+    probe = GroqProvider(api_key="test", client=client([]), token_budget=TokenBudgetManager(7000))
+    input_tokens = probe._messages(prompt, payload, settings.research_agent_input_token_limit)[1]
+    now = [0.0]
+    budget = TokenBudgetManager(7000, clock=lambda: now[0])
+    assert budget.reserve_or_delay(7000 - input_tokens - 300) == 0
+    fake = client([
+        completion({"partial": True}, finish_reason="length", output_tokens=300),
+        completion({"partial": True}, finish_reason="length", output_tokens=300),
+        completion({"ok": True}),
+    ])
+    provider = GroqProvider(api_key="test", client=fake, token_budget=budget, sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
+    assert asyncio.run(provider.complete_json(prompt, payload, agent="news_analyst", max_output_tokens=800)) == {"ok": True}
+    assert [request["max_completion_tokens"] for request in fake.chat.completions.requests] == [300, 300, 300]
+    assert fake.chat.completions.requests[-1]["model"] == "qwen/qwen3.6-27b"
 
 
 def test_token_429_respects_retry_after_and_max_retry_count():
@@ -281,16 +316,57 @@ def test_visible_length_after_compact_retry_falls_back_to_qwen_once():
     ]
 
 
-def test_synthesizer_length_retry_uses_the_minimal_final_contract():
+def test_synthesizer_length_retry_routes_directly_to_gpt_oss_with_a_bounded_cap():
     fake = client([
         completion({"partial": True}, finish_reason="length", output_tokens=1000),
         completion({"ok": True}),
     ])
     provider = GroqProvider(api_key="test", client=fake, token_budget=TokenBudgetManager(7000))
     assert asyncio.run(provider.complete_json("normal synthesis prompt", {"news_summary": {"summary": "x" * 500}}, agent="research_synthesizer", max_output_tokens=1000)) == {"ok": True}
-    assert "maximum 25 words" in fake.chat.completions.requests[1]["messages"][0]["content"]
-    assert "source_id and snippet are required" in fake.chat.completions.requests[1]["messages"][0]["content"]
-    assert "normal synthesis prompt" not in fake.chat.completions.requests[1]["messages"][0]["content"]
+    assert fake.chat.completions.requests[1]["model"] == "openai/gpt-oss-20b"
+    assert fake.chat.completions.requests[1]["max_completion_tokens"] == 600
+    assert "normal synthesis prompt" in fake.chat.completions.requests[1]["messages"][0]["content"]
+
+
+def test_synthesizer_truncation_routes_qwen_to_gpt_oss_without_output_cap_expansion():
+    fake = client([
+        completion({"partial": True}, finish_reason="length", output_tokens=1200),
+        completion({"partial": True}, finish_reason="length", output_tokens=600),
+        completion({"ok": True}),
+    ])
+    provider = GroqProvider(api_key="test", client=fake, token_budget=TokenBudgetManager(7000))
+    assert asyncio.run(provider.complete_json("prompt", {}, agent="research_synthesizer", max_output_tokens=1200)) == {"ok": True}
+    assert [request["max_completion_tokens"] for request in fake.chat.completions.requests] == [1200, 600, 400]
+    assert [request["model"] for request in fake.chat.completions.requests] == [
+        "qwen/qwen3.6-27b", "openai/gpt-oss-20b", "openai/gpt-oss-20b",
+    ]
+
+
+def test_synthesizer_malformed_response_routes_qwen_primary_to_gpt_oss_fallback():
+    malformed = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="not json"), finish_reason="stop")])
+    fake = client([malformed, completion({"ok": True})])
+    provider = GroqProvider(api_key="test", client=fake, token_budget=TokenBudgetManager(7000))
+    assert asyncio.run(provider.complete_json("prompt", {}, agent="research_synthesizer", max_output_tokens=1200)) == {"ok": True}
+    assert [request["model"] for request in fake.chat.completions.requests] == ["qwen/qwen3.6-27b", "openai/gpt-oss-20b"]
+
+
+def test_synthesizer_transport_failure_routes_qwen_primary_to_gpt_oss_fallback():
+    unavailable = ProviderException(500, {"error": {"message": "server unavailable"}})
+    fake = client([unavailable, completion({"ok": True})])
+    provider = GroqProvider(api_key="test", client=fake, sleep=lambda _: None, token_budget=TokenBudgetManager(7000))
+    assert asyncio.run(provider.complete_json("prompt", {}, agent="research_synthesizer", max_output_tokens=1200)) == {"ok": True}
+    assert [request["model"] for request in fake.chat.completions.requests] == ["qwen/qwen3.6-27b", "openai/gpt-oss-20b"]
+
+
+def test_free_tier_scheduler_counts_input_and_completion_within_seven_thousand_tokens():
+    assert settings.groq_tpm_limit == settings.groq_safe_tpm_limit == 7000
+    budget = TokenBudgetManager(settings.groq_safe_tpm_limit)
+    provider = GroqProvider(api_key="test", client=client([completion()]), token_budget=budget)
+    prompt, payload = "prompt", {"articles": ["x" * 2400]}
+    asyncio.run(provider.complete_json(prompt, payload, agent="news_analyst", max_output_tokens=1600))
+    request = provider.client.chat.completions.requests[0]
+    input_tokens = provider._messages(prompt, payload, settings.research_agent_input_token_limit)[1]
+    assert input_tokens + request["max_completion_tokens"] <= 7000
 
 
 def test_primary_models_route_research_agents_to_gpt_oss_and_synthesizer_to_qwen():

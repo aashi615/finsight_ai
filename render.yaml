@@ -21,6 +21,24 @@ services:
         value: groq
       - key: LLM_MODEL
         value: openai/gpt-oss-120b
+      # Free-tier guard: every LLM request reserves input + completion from the
+      # same 7K rolling budget; these are generous per-agent ceilings only.
+      - key: GROQ_TPM_LIMIT
+        value: "7000"
+      - key: GROQ_SAFE_TPM_LIMIT
+        value: "7000"
+      - key: NEWS_MAX_OUTPUT_TOKENS
+        value: "1600"
+      - key: MARKET_MAX_OUTPUT_TOKENS
+        value: "1400"
+      - key: RAG_MAX_OUTPUT_TOKENS
+        value: "1200"
+      - key: FINAL_MAX_OUTPUT_TOKENS
+        value: "1200"
+      - key: FINAL_COMPACT_MAX_OUTPUT_TOKENS
+        value: "600"
+      - key: FINAL_FALLBACK_MAX_OUTPUT_TOKENS
+        value: "400"
       - key: CORS_ORIGINS
         sync: false
       - key: FRONTEND_URL

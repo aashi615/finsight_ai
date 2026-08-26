@@ -25,15 +25,20 @@ class Settings(BaseSettings):
     groq_final_model: str = "qwen/qwen3.6-27b"
     groq_reasoning_fallback_model: str = "qwen/qwen3.6-27b"
     max_llm_concurrency: int = 2
-    # LLM budgets are deliberately conservative: Groq TPM includes prompt and
-    # completion tokens, so these limits are part of the production contract.
-    news_max_output_tokens: int = 800
-    market_max_output_tokens: int = 900
-    rag_max_output_tokens: int = 800
-    # The final result is deliberately compact.  Keeping it below 1,600 avoids
-    # consuming the entire organization-wide 8k TPM allowance in one request.
-    final_max_output_tokens: int = 1600
-    groq_tpm_limit: int = 8000
+    # Per-agent ceilings leave enough room for low-effort reasoning plus a
+    # complete JSON response. They are not independent reservations: the
+    # shared rolling scheduler below always enforces input + output <= 7,000.
+    news_max_output_tokens: int = 1600
+    market_max_output_tokens: int = 1400
+    rag_max_output_tokens: int = 1200
+    # Synthesis stays compact because it returns IDs rather than copied source
+    # records, but has enough room for all prose fields and valid JSON.
+    final_max_output_tokens: int = 1200
+    final_compact_max_output_tokens: int = 600
+    final_fallback_max_output_tokens: int = 400
+    # Free-tier shared rolling budget. This includes prompt, reasoning, and
+    # visible completion tokens for every agent and retry.
+    groq_tpm_limit: int = 7000
     groq_safe_tpm_limit: int = 7000
     max_llm_retries: int = 2
     groq_retry_safety_seconds: float = 0.25

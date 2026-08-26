@@ -37,10 +37,12 @@ class FakeLLMProvider:
             def manifest_id(item):
                 match = next((entry for entry in manifest if entry["source_type"] == item["source_type"] and entry["title"] == item["snippet"] and entry["source"] == item.get("url")), None)
                 return match["evidence_id"] if match else None
-            evidence = [{"evidence_id": manifest_id(item), **item} for item in evidence]
-            claim = [{"claim": "Based on available data, this is a monitored signal.", "evidence": evidence[:1]}] if evidence else []
+            evidence_ids = [manifest_id(item) for item in evidence]
+            claim = [{"claim": "Based on available data, this is a monitored signal.", "evidence_ids": evidence_ids[:1]}] if evidence_ids else []
         market_summary = (payload.get("market_summary") or {}).get("summary", "")
         market_analysis = "Historical market-price data is unavailable; no historical price performance was assessed." if "Historical market-price data is unavailable" in market_summary else "Market data suggests recent movement."
+        if payload.get("evidence_manifest"):
+            return {"executive_summary": "Based on available data, the evidence indicates monitored developments.", "company_overview": "Company overview is based on available data.", "market_analysis": market_analysis, "news_analysis": "News coverage indicates recent themes.", "key_risks": claim, "key_opportunities": claim, "evidence_ids": evidence_ids, "confidence": 0.6, "generated_at": datetime.now(timezone.utc).isoformat()}
         return {"executive_summary": "Based on available data, the evidence indicates monitored developments.", "company_overview": "Company overview is based on available data.", "market_analysis": market_analysis, "news_analysis": "News coverage indicates recent themes.", "key_risks": claim, "key_opportunities": claim, "evidence": evidence, "confidence": 0.6, "generated_at": datetime.now(timezone.utc).isoformat()}
 
 

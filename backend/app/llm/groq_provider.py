@@ -174,9 +174,14 @@ class GroqProvider:
             incomplete_retried = False
             active_prompt = prompt
             force_compact_input = False
-            fallback_used = force_fallback and agent != "research_synthesizer"
-            active_model = settings.groq_reasoning_fallback_model if fallback_used else model
-            if fallback_used:
+            # A retry/fallback belongs to this one completion attempt.  Once
+            # the TPM scheduler has bounded a request, never expand that cap
+            # merely because the response was reconciled with lower actual
+            # usage.  Otherwise a 300-token News request can retry at 800.
+            active_output_cap = max_output_tokens
+            fallback_used = force_fallback
+            active_model = self._fallback_model_for(agent) if fallback_used else model
+            if fallback_used and active_model.startswith("qwen/"):
                 self._verify_model_available(active_model)
             request_attempt = 0
             while transport_attempt <= (0 if fallback_used else settings.max_llm_retries):
@@ -190,7 +195,7 @@ class GroqProvider:
                 try:
                     messages, estimated_input_tokens, input_compacted = self._messages(active_prompt, payload, input_limit, force_compact=force_compact_input)
                     requested_output_tokens, estimated_total_tokens = self._reserve_available_tpm(
-                        agent, active_model, estimated_input_tokens, max_output_tokens, request_attempt,
+                        agent, active_model, estimated_input_tokens, active_output_cap, request_attempt,
                     )
                     request = {
                         "model": active_model,
@@ -211,21 +216,29 @@ class GroqProvider:
                     response_details = self._response_details(content, choice, message, request_id, usage)
                     logger.info("groq_response_received", extra={"provider": "groq", "agent": agent, "model": active_model, "configured_output_limit": max_output_tokens, "requested_max_output_tokens": requested_output_tokens, **response_details})
                     if getattr(choice, "finish_reason", None) == "length":
+                        active_output_cap = self._next_retry_output_cap(agent, active_output_cap, requested_output_tokens, fallback=fallback_used)
                         empty_visible_content = not isinstance(content, str) or not content.strip()
                         event = "groq_reasoning_budget_exhausted" if empty_visible_content else "groq_output_budget_exhausted"
                         logger.warning(event, extra={"provider": "groq", "agent": agent, "model": active_model, "attempt": request_attempt, "configured_output_limit": max_output_tokens, "requested_max_output_tokens": requested_output_tokens, **self._response_details(content, choice, message, request_id, usage, include_preview=True)})
+                        if agent == "research_synthesizer" and self._activate_fallback(agent, model, active_model, fallback_used, "completion_limit"):
+                            active_model, fallback_used = self._fallback_model_for(agent), True
+                            continue
                         if not incomplete_retried:
                             incomplete_retried = True
                             force_compact_input = True
                             active_prompt = self._compact_retry_prompt(agent, prompt)
                             if empty_visible_content and self._activate_fallback(agent, model, active_model, fallback_used, "empty_visible_content_at_completion_limit"):
-                                active_model = settings.groq_reasoning_fallback_model
+                                active_output_cap = self._next_retry_output_cap(agent, active_output_cap, requested_output_tokens, fallback=True)
+                                active_model = self._fallback_model_for(agent)
                                 fallback_used = True
-                                self._verify_model_available(active_model)
+                                if active_model.startswith("qwen/"):
+                                    self._verify_model_available(active_model)
                             continue
+                        active_output_cap = self._next_retry_output_cap(agent, active_output_cap, requested_output_tokens, fallback=True)
                         if self._activate_fallback(agent, model, active_model, fallback_used, "completion_limit"):
-                            active_model, fallback_used = settings.groq_reasoning_fallback_model, True
-                            self._verify_model_available(active_model)
+                            active_model, fallback_used = self._fallback_model_for(agent), True
+                            if active_model.startswith("qwen/"):
+                                self._verify_model_available(active_model)
                             continue
                         category = "llm_reasoning_budget_exhausted" if empty_visible_content else "llm_incomplete_response"
                         raise LLMProviderError("Groq exhausted the completion budget before returning visible JSON." if empty_visible_content else "Groq response was incomplete because it reached the output token limit.", category=category)
@@ -233,18 +246,29 @@ class GroqProvider:
                     logger.info("llm_usage", extra={"provider": "groq", "agent": agent, "model": active_model, "estimated_input_tokens": estimated_input_tokens, "configured_max_output_tokens": max_output_tokens, "requested_max_output_tokens": requested_output_tokens, "estimated_total_tokens": estimated_total_tokens, "actual_prompt_tokens": getattr(usage, "prompt_tokens", estimated_input_tokens), "actual_completion_tokens": getattr(usage, "completion_tokens", None), "actual_total_tokens": getattr(usage, "total_tokens", None), "finish_reason": getattr(choice, "finish_reason", None), "visible_content_exists": bool(isinstance(content, str) and content.strip()), "reasoning_content_exists": self._reasoning_content(message) is not None, "request_id": getattr(response, "_request_id", None)})
                     return parsed
                 except (StructuredOutputParseError, TypeError, KeyError, IndexError) as exc:
+                    # A malformed/truncated response is retried with no more
+                    # than the capacity already granted to this attempt.
+                    if estimated_total_tokens is not None:
+                        active_output_cap = min(active_output_cap, requested_output_tokens)
                     stage = getattr(exc, "stage", "response_content")
                     event = {"empty_response": "groq_empty_response", "json_extraction": "groq_json_extraction_failed", "json_decode": "groq_json_decode_failed"}.get(stage, "groq_json_parse_failed")
                     diagnostics = self._response_details(content, choice, message, request_id, usage, include_preview=True) if choice is not None else response_details
                     logger.warning(event, extra={"provider": "groq", "agent": agent, "model": active_model, "request_id": request_id, "response_parsing_stage": stage, **diagnostics})
                     if not incomplete_retried and not fallback_used:
+                        if agent == "research_synthesizer" and self._activate_fallback(agent, model, active_model, fallback_used, "invalid_json"):
+                            active_output_cap = self._next_retry_output_cap(agent, active_output_cap, requested_output_tokens, fallback=False)
+                            active_model, fallback_used, transport_attempt = self._fallback_model_for(agent), True, 0
+                            force_compact_input = True
+                            continue
                         incomplete_retried, force_compact_input = True, True
                         active_prompt = self._compact_retry_prompt(agent, prompt)
                         continue
                     if self._activate_fallback(agent, model, active_model, fallback_used, "invalid_json"):
-                        active_model, fallback_used, transport_attempt = settings.groq_reasoning_fallback_model, True, 0
+                        active_output_cap = self._next_retry_output_cap(agent, active_output_cap, requested_output_tokens, fallback=True)
+                        active_model, fallback_used, transport_attempt = self._fallback_model_for(agent), True, 0
                         force_compact_input = True
-                        self._verify_model_available(active_model)
+                        if active_model.startswith("qwen/"):
+                            self._verify_model_available(active_model)
                         continue
                     raise LLMProviderError(f"Groq returned malformed JSON output at {stage}.", category="llm_invalid_response") from exc
                 except LLMProviderError:
@@ -257,12 +281,13 @@ class GroqProvider:
                         self._token_budget.release_latest(estimated_total_tokens)
                     category, retryable, retry_after = self._classify_error(exc)
                     self._log_error(agent, active_model, transport_attempt + 1, category, exc)
-                    if not retryable or transport_attempt >= settings.max_llm_retries or fallback_used:
+                    if agent == "research_synthesizer" or not retryable or transport_attempt >= settings.max_llm_retries or fallback_used:
                         if self._activate_fallback(agent, model, active_model, fallback_used, category):
-                            active_model, fallback_used, transport_attempt = settings.groq_reasoning_fallback_model, True, 0
+                            active_model, fallback_used, transport_attempt = self._fallback_model_for(agent), True, 0
                             force_compact_input = True
                             active_prompt = self._compact_retry_prompt(agent, prompt)
-                            self._verify_model_available(active_model)
+                            if active_model.startswith("qwen/"):
+                                self._verify_model_available(active_model)
                             continue
                         message = "Groq quota is exhausted." if category == "llm_quota_exhausted" else "Groq rejected the requested JSON output." if category == "llm_invalid_response" else "Groq provider is temporarily unavailable."
                         raise LLMProviderError(message, category=category) from exc
@@ -277,6 +302,12 @@ class GroqProvider:
         return settings.groq_final_model if agent == "research_synthesizer" else settings.groq_research_model
 
     @staticmethod
+    def _fallback_model_for(agent: str) -> str:
+        # Only synthesis reverses the normal routing: Qwen primary then
+        # GPT-OSS fallback. Research specialists remain GPT-OSS → Qwen.
+        return settings.groq_research_model if agent == "research_synthesizer" else settings.groq_reasoning_fallback_model
+
+    @staticmethod
     def _compact_retry_prompt(agent: str, original_prompt: str) -> str:
         if agent == "research_synthesizer":
             return COMPACT_RETRY_PROMPT
@@ -284,10 +315,19 @@ class GroqProvider:
 
     @staticmethod
     def _activate_fallback(agent: str, primary_model: str, active_model: str, fallback_used: bool, reason: str) -> bool:
-        eligible = agent != "research_synthesizer" and reason != "llm_quota_exhausted" and not fallback_used and active_model == primary_model
+        eligible = reason != "llm_quota_exhausted" and not fallback_used and active_model == primary_model
         if eligible:
-            logger.warning("llm_fallback_triggered", extra={"provider": "groq", "agent": agent, "primary_model": primary_model, "fallback_model": settings.groq_reasoning_fallback_model, "reason": reason, "fallback_used": True})
+            logger.warning("llm_fallback_triggered", extra={"provider": "groq", "agent": agent, "primary_model": primary_model, "fallback_model": GroqProvider._fallback_model_for(agent), "reason": reason, "fallback_used": True})
         return eligible
+
+    @staticmethod
+    def _next_retry_output_cap(agent: str, active_cap: int, requested_cap: int, *, fallback: bool) -> int:
+        """Keep retries bounded; synthesis stages are explicitly 800→450→350."""
+        cap = min(active_cap, requested_cap)
+        if agent != "research_synthesizer":
+            return cap
+        stage_cap = settings.final_fallback_max_output_tokens if fallback else settings.final_compact_max_output_tokens
+        return min(cap, stage_cap)
 
     def _verify_model_available(self, model: str) -> None:
         """Fail clearly when the configured project cannot use the Qwen model."""
@@ -338,7 +378,7 @@ class GroqProvider:
             "news_analyst": 300,
             "market_analyst": 300,
             "document_rag_agent": 300,
-            "research_synthesizer": 1200,
+            "research_synthesizer": settings.final_fallback_max_output_tokens,
         }[agent]
 
     def _reserve_available_tpm(self, agent: str, model: str, estimated_input: int, configured_output: int, retry_number: int) -> tuple[int, int]:
@@ -361,7 +401,7 @@ class GroqProvider:
             # every six seconds only creates noisy delayed logs and cannot add
             # TPM capacity before the oldest rolling reservation expires.
             poll_delay = delay
-            logger.warning("llm_request_delayed", extra={"provider": "groq", "agent": agent, "model": model, "estimated_input_tokens": estimated_input, "configured_max_output_tokens": configured_output, "requested_max_output_tokens": minimum_output, "estimated_tokens": estimated_input + minimum_output, "available_tpm": available, "delay_seconds": round(poll_delay, 3), "reason": "tpm_budget", "retry_number": retry_number})
+            logger.warning("llm_request_delayed", extra={"provider": "groq", "agent": agent, "model": model, "estimated_input_tokens": estimated_input, "configured_max_output_tokens": configured_output, "requested_max_output_tokens": configured_output, "minimum_output_tokens": minimum_output, "estimated_tokens": estimated_input + minimum_output, "available_tpm": available, "delay_seconds": round(poll_delay, 3), "reason": "tpm_budget", "retry_number": retry_number})
             self._sleep(poll_delay)
 
     @staticmethod

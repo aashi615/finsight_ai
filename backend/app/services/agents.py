@@ -37,6 +37,56 @@ def _only_supplied_evidence(result, supplied: list[Evidence]):
     return result
 
 
+def _normalize_intermediate_evidence(payload: dict, supplied: list[Evidence] | None) -> dict:
+    """Restore required top-level citations only when claims cite exact inputs.
+
+    Specialist schemas require every claim citation to also be present in the
+    top-level evidence list. Models occasionally omit this duplicate list even
+    while returning exact supplied citations. This normalizes that structural
+    omission before Pydantic; an altered/invented claim is deliberately left
+    unchanged and therefore still rejected by strict validation.
+    """
+    if not isinstance(payload, dict) or not supplied:
+        return payload
+    allowed = {evidence_identity(item): item for item in supplied}
+    claims = [*payload.get("signals", []), *payload.get("findings", [])]
+    cited: list[dict] = []
+    for claim in claims:
+        if not isinstance(claim, dict) or not isinstance(claim.get("evidence"), list):
+            return payload
+        for item in claim["evidence"]:
+            try:
+                candidate = Evidence.model_validate(item)
+            except ValidationError:
+                return payload
+            if evidence_identity(candidate) not in allowed:
+                return payload
+            cited.append(allowed[evidence_identity(candidate)].model_dump())
+    if not cited:
+        return payload
+    existing = payload.get("evidence")
+    if not isinstance(existing, list):
+        return payload
+    normalized = dict(payload)
+    canonical = []
+    seen = set()
+    for item in [*existing, *cited]:
+        try:
+            candidate = Evidence.model_validate(item)
+        except ValidationError:
+            return payload
+        identity = evidence_identity(candidate)
+        if identity not in allowed:
+            return payload
+        if identity not in seen:
+            seen.add(identity)
+            canonical.append(allowed[identity].model_dump())
+    if canonical != existing:
+        normalized["evidence"] = canonical
+        logger.info("agent_top_level_evidence_normalized", extra={"agent": payload.get("agent"), "returned_evidence_count": len(canonical)})
+    return normalized
+
+
 def _with_stable_evidence_ids(analysis, source_agent: str):
     """Assign deterministic, internal references to an upstream evidence set."""
     evidence = [
@@ -127,9 +177,149 @@ def _normalize_synthesis_response(payload: dict) -> dict:
     return normalized
 
 
+def _resolve_synthesis_evidence_ids(payload: dict, manifest: dict[str, Evidence]) -> dict:
+    """Turn the final model's ID-only citations into the public Evidence shape.
+
+    The model never supplies source metadata at this boundary. Every accepted
+    ID must be an exact locally-created manifest key, then the corresponding
+    canonical record is restored for Pydantic and the public API.
+    """
+    if not isinstance(payload, dict):
+        return payload
+
+    def resolve_ids(value, *, field: str, require_one: bool = False) -> tuple[list[str], list[dict]]:
+        if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
+            raise AgentFailure(f"Synthesizer returned invalid {field}.", category="llm_invalid_response")
+        if require_one and not value:
+            raise AgentFailure(f"Synthesizer returned empty {field}.", category="llm_invalid_response")
+        if len(value) != len(set(value)):
+            raise AgentFailure("Synthesizer returned duplicate evidence IDs.", category="llm_invalid_response")
+        unknown = [item for item in value if item not in manifest]
+        if unknown:
+            raise AgentFailure("Synthesizer returned unsupported evidence IDs.", category="llm_invalid_response")
+        return value, [{**manifest[item].model_dump(), "evidence_id": item} for item in value]
+
+    normalized = dict(payload)
+    top_ids, top_evidence = resolve_ids(normalized.pop("evidence_ids", None), field="evidence_ids", require_one=True)
+    normalized["evidence"] = top_evidence
+    for field in ("key_risks", "key_opportunities"):
+        claims = normalized.get(field)
+        if not isinstance(claims, list):
+            continue
+        repaired = []
+        for claim in claims:
+            if not isinstance(claim, dict):
+                repaired.append(claim)
+                continue
+            item = dict(claim)
+            claim_ids, claim_evidence = resolve_ids(item.pop("evidence_ids", None), field=f"{field}.evidence_ids", require_one=True)
+            if any(evidence_id not in top_ids for evidence_id in claim_ids):
+                raise AgentFailure("Synthesizer claim cites evidence absent from top-level evidence_ids.", category="llm_invalid_response")
+            item["evidence"] = claim_evidence
+            repaired.append(item)
+        normalized[field] = repaired
+    return _normalize_synthesis_response(normalized)
+
+
+def _restore_manifest_evidence(payload: dict, manifest: dict[str, Evidence]) -> dict:
+    """Replace model-copied citations with the canonical evidence records.
+
+    A model is only trusted to select a manifest ID.  It is not trusted to
+    reproduce source metadata verbatim: titles, URLs, and IDs commonly drift
+    despite an otherwise useful answer.  Resolving known IDs before schema
+    validation removes that fragile duplication while rejecting unknown IDs in
+    the existing final validation step.
+    """
+    if not isinstance(payload, dict):
+        return payload
+
+    def resolve(item):
+        if not isinstance(item, dict):
+            return item
+        evidence_id = item.get("evidence_id") or item.get("source_id")
+        canonical = manifest.get(evidence_id)
+        # evidence_id is intentionally excluded from public serialization, but
+        # it must survive this private model-to-model hand-off.
+        return {**canonical.model_dump(), "evidence_id": canonical.evidence_id} if canonical else item
+
+    def resolve_list(items):
+        return [resolve(item) for item in items] if isinstance(items, list) else items
+
+    normalized = dict(payload)
+    top_level = resolve_list(normalized.get("evidence"))
+    normalized["evidence"] = top_level
+    cited = []
+    for field in ("key_risks", "key_opportunities"):
+        claims = normalized.get(field)
+        if not isinstance(claims, list):
+            continue
+        repaired_claims = []
+        for claim in claims:
+            if not isinstance(claim, dict):
+                repaired_claims.append(claim)
+                continue
+            repaired = dict(claim)
+            repaired["evidence"] = resolve_list(repaired.get("evidence"))
+            repaired_claims.append(repaired)
+            if isinstance(repaired["evidence"], list):
+                cited.extend(repaired["evidence"])
+        normalized[field] = repaired_claims
+
+    # The top-level evidence list is a redundant display index. Add valid
+    # claim citations that a model omitted there so the strict public schema is
+    # preserved without ever adding evidence that was not in the manifest.
+    if isinstance(top_level, list):
+        canonical_identities = {evidence_identity(item) for item in manifest.values()}
+        seen = set()
+        deduplicated = []
+        # `resolve` returns dicts; validate only canonical values to avoid
+        # accidentally repairing an unknown or malformed citation.
+        for item in [*top_level, *cited]:
+            try:
+                candidate = Evidence.model_validate(item)
+            except ValidationError:
+                deduplicated.append(item)
+                continue
+            identity = evidence_identity(candidate)
+            if identity in canonical_identities and identity not in seen:
+                deduplicated.append({**candidate.model_dump(), "evidence_id": candidate.evidence_id})
+                seen.add(identity)
+            elif identity not in canonical_identities:
+                # Preserve an invalid citation so the final validation reports
+                # it instead of silently accepting altered source content.
+                deduplicated.append(item)
+        normalized["evidence"] = deduplicated
+    return _normalize_synthesis_response(normalized)
+
+
+def _deterministic_synthesis(analyses: list, manifest: dict[str, Evidence]) -> ResearchSynthesis:
+    """Safe availability fallback when all final-model attempts are unusable."""
+    by_type = {analysis.__class__.__name__: analysis.summary for analysis in analyses}
+    return ResearchSynthesis(
+        executive_summary="Based on available data, source evidence was collected but automated synthesis was unavailable.",
+        company_overview="Company-specific interpretation is unavailable because the final synthesis model did not return a valid response.",
+        market_analysis=by_type.get("MarketAnalysis", "Historical market-price data could not be assessed from available sources."),
+        news_analysis=by_type.get("NewsAnalysis", "No usable recent-news analysis was available."),
+        key_risks=[],
+        key_opportunities=[],
+        evidence=list(manifest.values()),
+        confidence=0.2,
+        generated_at=datetime.now(timezone.utc),
+    )
+
+
+def _log_deterministic_fallback(agent: str, exc: Exception) -> None:
+    logger.warning(
+        "agent_deterministic_fallback_used",
+        extra={"agent": agent, "error_category": getattr(exc, "category", "llm_invalid_response"), "error_detail": str(exc)},
+    )
+
+
 async def _complete_validated(llm: LLMProvider, model, prompt: str, payload: dict, *, agent: str, max_output_tokens: int, require_evidence: bool = False, supplied_evidence: list[Evidence] | None = None):
     """Use the provider fallback once when local schema validation rejects GPT-OSS."""
     def validate_response(response):
+        if supplied_evidence is not None:
+            response = _normalize_intermediate_evidence(response, supplied_evidence)
         result = _validate(model, response, agent=agent)
         if require_evidence and not result.evidence:
             logger.warning("agent_required_evidence_missing", extra={"agent": agent, "supplied_evidence_count": len(payload.get("evidence", [])), "returned_evidence_count": 0})
@@ -167,8 +357,13 @@ class MarketAnalystAgent:
         result = await self._complete(MarketAnalysis, market.PROMPT, payload, require_evidence=True, supplied_evidence=evidence)
         return result.model_copy(update={"metrics": metrics})
     async def _complete(self, model, prompt, payload, *, require_evidence: bool = False, supplied_evidence: list[Evidence] | None = None):
-        try: return await _complete_validated(self.llm, model, prompt, payload, agent="market_analyst", max_output_tokens=settings.market_max_output_tokens, require_evidence=require_evidence, supplied_evidence=supplied_evidence)
-        except LLMProviderError as exc: raise AgentFailure("Market agent failed.", category=exc.category) from exc
+        try:
+            return await _complete_validated(self.llm, model, prompt, payload, agent="market_analyst", max_output_tokens=settings.market_max_output_tokens, require_evidence=require_evidence, supplied_evidence=supplied_evidence)
+        except (LLMProviderError, AgentFailure) as exc:
+            # The calculated metrics and provider evidence are already trusted.
+            # Keep them usable if narrative generation is unavailable.
+            _log_deterministic_fallback("market_analyst", exc)
+            return MarketAnalysis(summary="Market source data was collected; automated narrative analysis was unavailable.", metrics=payload.get("calculated_metrics", {}), signals=[], evidence=supplied_evidence or [])
 
 
 class NewsAnalystAgent:
@@ -180,8 +375,11 @@ class NewsAnalystAgent:
             return NewsAnalysis(summary="No recent news is available.", themes=[], signals=[], evidence=[])
         evidence = evidence[:settings.news_article_limit]
         payload = {"question": context["question"][:500], "articles": [{"source_id": str(article.id), "title": article.title[:180], "summary": (article.summary or "")[:settings.news_article_snippet_chars], "published_at": article.published_at.date().isoformat()} for article in articles[:settings.news_article_limit]], "evidence": [item.model_dump() for item in evidence]}
-        try: return await _complete_validated(self.llm, NewsAnalysis, news.PROMPT, payload, agent="news_analyst", max_output_tokens=settings.news_max_output_tokens, require_evidence=True, supplied_evidence=evidence)
-        except LLMProviderError as exc: raise AgentFailure("News agent failed.", category=exc.category) from exc
+        try:
+            return await _complete_validated(self.llm, NewsAnalysis, news.PROMPT, payload, agent="news_analyst", max_output_tokens=settings.news_max_output_tokens, require_evidence=True, supplied_evidence=evidence)
+        except (LLMProviderError, AgentFailure) as exc:
+            _log_deterministic_fallback("news_analyst", exc)
+            return NewsAnalysis(summary="Recent news source records were collected; automated narrative analysis was unavailable.", themes=[], signals=[], evidence=evidence)
 
 
 class DocumentRagAgent:
@@ -193,8 +391,11 @@ class DocumentRagAgent:
             return DocumentAnalysis(summary="No tenant-owned documents matched this request.", findings=[], evidence=[])
         evidence = evidence[:settings.rag_top_k]
         payload = {"question": question[:500], "chunks": [{"document_id": str(chunk.document_id), "source": chunk.source_url, "page_number": chunk.page_number, "section": chunk.section, "text": chunk.content[:settings.rag_chunk_chars]} for chunk in chunks], "evidence": [item.model_dump() for item in evidence]}
-        try: return await _complete_validated(self.llm, DocumentAnalysis, document.PROMPT, payload, agent="document_rag_agent", max_output_tokens=settings.rag_max_output_tokens, require_evidence=True, supplied_evidence=evidence)
-        except LLMProviderError as exc: raise AgentFailure("Document agent failed.", category=exc.category) from exc
+        try:
+            return await _complete_validated(self.llm, DocumentAnalysis, document.PROMPT, payload, agent="document_rag_agent", max_output_tokens=settings.rag_max_output_tokens, require_evidence=True, supplied_evidence=evidence)
+        except (LLMProviderError, AgentFailure) as exc:
+            _log_deterministic_fallback("document_rag_agent", exc)
+            return DocumentAnalysis(summary="Relevant tenant document excerpts were collected; automated narrative analysis was unavailable.", findings=[], evidence=evidence)
 
 
 class ResearchSynthesizer:
@@ -233,19 +434,25 @@ class ResearchSynthesizer:
         payload = {"news_summary": news_analysis.model_dump() if news_analysis else None, "market_summary": market_analysis.model_dump() if market_analysis else None, "rag_summary": document_analysis.model_dump() if document_analysis else None, "evidence_manifest": evidence_manifest}
         try:
             response = await self.llm.complete_json(synthesis.PROMPT, payload, agent="research_synthesizer", max_output_tokens=settings.final_max_output_tokens)
-            result = _validate(ResearchSynthesis, _normalize_synthesis_response(response), agent="research_synthesizer")
+            result = _validate(ResearchSynthesis, _resolve_synthesis_evidence_ids(response, manifest), agent="research_synthesizer")
             return _canonical_synthesis_evidence(result, manifest)
-        except AgentFailure as primary_error:
+        except (AgentFailure, LLMProviderError) as primary_error:
             # Qwen is already the normal final model. A manifest/schema failure
             # gets one smaller corrective prompt through the same provider TPM
             # scheduler, rather than failing a job after an otherwise usable run.
             logger.warning("synthesizer_validation_retry", extra={"agent": "research_synthesizer", "error_category": primary_error.category})
             try:
-                response = await self.llm.complete_json(synthesis.COMPACT_RETRY_PROMPT, payload, agent="research_synthesizer", max_output_tokens=settings.final_max_output_tokens)
-                return _canonical_synthesis_evidence(_validate(ResearchSynthesis, _normalize_synthesis_response(response), agent="research_synthesizer"), manifest)
-            except LLMProviderError as exc:
-                raise AgentFailure("Synthesizer failed.", category=exc.category) from exc
-        except LLMProviderError as exc: raise AgentFailure("Synthesizer failed.", category=exc.category) from exc
+                response = await self.llm.complete_json(synthesis.COMPACT_RETRY_PROMPT, payload, agent="research_synthesizer", max_output_tokens=settings.final_compact_max_output_tokens, force_fallback=True)
+                result = _validate(ResearchSynthesis, _resolve_synthesis_evidence_ids(response, manifest), agent="research_synthesizer")
+                return _canonical_synthesis_evidence(result, manifest)
+            except (LLMProviderError, AgentFailure) as retry_error:
+                try:
+                    response = await self.llm.complete_json(synthesis.FALLBACK_PROMPT, payload, agent="research_synthesizer", max_output_tokens=settings.final_fallback_max_output_tokens, force_fallback=True)
+                    result = _validate(ResearchSynthesis, _resolve_synthesis_evidence_ids(response, manifest), agent="research_synthesizer")
+                    return _canonical_synthesis_evidence(result, manifest)
+                except (LLMProviderError, AgentFailure) as fallback_error:
+                    _log_deterministic_fallback("research_synthesizer", fallback_error)
+                    return _deterministic_synthesis(analyses, manifest)
 
 
 def _sample(items: list, limit: int) -> list:
