@@ -13,6 +13,7 @@ from groq import Groq
 from app.core.config import settings
 from app.llm.base import LLMProviderError
 from app.llm.local_embeddings import LocalEmbeddingProvider
+from app.prompts.synthesis import COMPACT_RETRY_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +205,7 @@ class GroqProvider:
                         if not incomplete_retried:
                             incomplete_retried = True
                             force_compact_input = True
-                            active_prompt = f"{prompt}\n\nReturn the smallest valid JSON object now. Use only required fields, empty arrays when there are no supported claims, and no prose outside JSON."
+                            active_prompt = self._compact_retry_prompt(agent, prompt)
                             if empty_visible_content and self._activate_fallback(agent, model, active_model, fallback_used, "empty_visible_content_at_completion_limit"):
                                 active_model = settings.groq_reasoning_fallback_model
                                 fallback_used = True
@@ -226,7 +227,7 @@ class GroqProvider:
                     logger.warning(event, extra={"provider": "groq", "agent": agent, "model": active_model, "request_id": request_id, "response_parsing_stage": stage, **diagnostics})
                     if not incomplete_retried and not fallback_used:
                         incomplete_retried, force_compact_input = True, True
-                        active_prompt = f"{prompt}\n\nReturn the smallest valid JSON object now. Use only required fields and no prose outside JSON."
+                        active_prompt = self._compact_retry_prompt(agent, prompt)
                         continue
                     if self._activate_fallback(agent, model, active_model, fallback_used, "invalid_json"):
                         active_model, fallback_used, transport_attempt = settings.groq_reasoning_fallback_model, True, 0
@@ -248,7 +249,7 @@ class GroqProvider:
                         if self._activate_fallback(agent, model, active_model, fallback_used, category):
                             active_model, fallback_used, transport_attempt = settings.groq_reasoning_fallback_model, True, 0
                             force_compact_input = True
-                            active_prompt = f"{prompt}\n\nReturn the smallest valid JSON object now. Use only required fields and no prose outside JSON."
+                            active_prompt = self._compact_retry_prompt(agent, prompt)
                             self._verify_model_available(active_model)
                             continue
                         message = "Groq quota is exhausted." if category == "llm_quota_exhausted" else "Groq rejected the requested JSON output." if category == "llm_invalid_response" else "Groq provider is temporarily unavailable."
@@ -262,6 +263,12 @@ class GroqProvider:
     @staticmethod
     def _model_for(agent: str) -> str:
         return settings.groq_final_model if agent == "research_synthesizer" else settings.groq_research_model
+
+    @staticmethod
+    def _compact_retry_prompt(agent: str, original_prompt: str) -> str:
+        if agent == "research_synthesizer":
+            return COMPACT_RETRY_PROMPT
+        return f"{original_prompt}\n\nReturn the smallest valid JSON object now. Use only required fields, empty arrays when there are no supported claims, and no prose outside JSON."
 
     @staticmethod
     def _activate_fallback(agent: str, primary_model: str, active_model: str, fallback_used: bool, reason: str) -> bool:
@@ -415,7 +422,10 @@ class GroqProvider:
 
 
 def _estimate_tokens(text: str) -> int:
-    return max(1, (len(text) + 3) // 4)
+    # JSON keys, UUIDs, URLs, dates, and escaped text tokenize more densely
+    # than ordinary prose. A 2.3-character estimate is intentionally safer
+    # for the 8k TPM scheduler than the previous 4-character approximation.
+    return max(1, (len(text) + 2) // 3)
 
 
 def _compact_text(text: str, limit: int = 280) -> str:

@@ -185,7 +185,7 @@ def test_groq_enforces_agent_output_budgets():
         ("news_analyst", 4096, 800),
         ("market_analyst", 4913, 900),
         ("document_rag_agent", 2000, 800),
-        ("research_synthesizer", 5000, 1000),
+        ("research_synthesizer", 5000, 1500),
     ]:
         asyncio.run(provider.complete_json("prompt", {}, agent=agent, max_output_tokens=requested))
         assert fake.chat.completions.requests[-1]["max_completion_tokens"] == expected
@@ -232,6 +232,17 @@ def test_visible_length_after_compact_retry_falls_back_to_qwen_once():
     assert [request["model"] for request in fake.chat.completions.requests] == [
         "openai/gpt-oss-20b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b",
     ]
+
+
+def test_synthesizer_length_retry_uses_the_minimal_final_contract():
+    fake = client([
+        completion({"partial": True}, finish_reason="length", output_tokens=1000),
+        completion({"ok": True}),
+    ])
+    provider = GroqProvider(api_key="test", client=fake, token_budget=TokenBudgetManager(7000))
+    assert asyncio.run(provider.complete_json("normal synthesis prompt", {"news_summary": {"summary": "x" * 500}}, agent="research_synthesizer", max_output_tokens=1000)) == {"ok": True}
+    assert "one sentence, maximum 30 words" in fake.chat.completions.requests[1]["messages"][0]["content"]
+    assert "normal synthesis prompt" not in fake.chat.completions.requests[1]["messages"][0]["content"]
 
 
 def test_primary_models_route_research_agents_to_gpt_oss_and_synthesizer_to_qwen():

@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     news_max_output_tokens: int = 800
     market_max_output_tokens: int = 900
     rag_max_output_tokens: int = 800
-    final_max_output_tokens: int = 1000
+    final_max_output_tokens: int = 1500
     groq_tpm_limit: int = 8000
     groq_safe_tpm_limit: int = 7000
     max_llm_retries: int = 2
