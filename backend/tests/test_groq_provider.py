@@ -160,7 +160,7 @@ def test_groq_rate_limit_retries_but_quota_does_not():
     delays = []
     provider = GroqProvider(api_key="test", client=fake, sleep=delays.append, random_value=lambda: 0)
     assert asyncio.run(provider.complete_json("system", {}, agent="news_analyst", max_output_tokens=900)) == {"ok": True}
-    assert fake.chat.completions.calls == 2 and delays == [7]
+    assert fake.chat.completions.calls == 2 and delays == [1.25]
 
     quota = ProviderException(429, {"error": {"code": "insufficient_quota", "message": "quota exhausted"}})
     fake = client([quota])
@@ -197,6 +197,17 @@ def test_tpm_guard_delays_when_request_would_exceed_safe_limit():
     assert budget.reserve_or_delay(1200) > 0
 
 
+def test_request_uses_current_available_output_budget_instead_of_waiting_for_configured_cap():
+    budget = TokenBudgetManager(7000)
+    assert budget.reserve_or_delay(3500) == 0
+    fake = client([completion()])
+    provider = GroqProvider(api_key="test", client=fake, token_budget=budget)
+    asyncio.run(provider.complete_json("prompt", {}, agent="research_synthesizer", max_output_tokens=5200))
+    request = fake.chat.completions.requests[0]
+    input_tokens = provider._messages("prompt", {}, settings.final_agent_input_token_limit)[1]
+    assert request["max_completion_tokens"] == 3500 - input_tokens
+
+
 def test_token_429_respects_retry_after_and_max_retry_count():
     limited = ProviderException(429, {"error": {"type": "tokens", "code": "rate_limit_exceeded"}})
     limited.response.headers = {"retry-after": "3"}
@@ -204,7 +215,7 @@ def test_token_429_respects_retry_after_and_max_retry_count():
     delays = []
     provider = GroqProvider(api_key="test", client=fake, sleep=delays.append, random_value=lambda: 0, token_budget=TokenBudgetManager(7000))
     assert asyncio.run(provider.complete_json("prompt", {}, agent="news_analyst", max_output_tokens=700)) == {"ok": True}
-    assert delays == [9] and fake.chat.completions.calls == 2
+    assert delays == [3.25] and fake.chat.completions.calls == 2
 
 
 def test_empty_gpt_oss_length_response_uses_non_thinking_fallback_not_same_request():

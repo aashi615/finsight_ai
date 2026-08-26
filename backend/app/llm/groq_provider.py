@@ -53,6 +53,17 @@ class TokenBudgetManager:
                 return 60.0
             return max(0.01, 60.0 - (self._clock() - self._reservations[0][0]))
 
+    def delay_for(self, tokens: int) -> float:
+        """Return the wait needed without creating another reservation."""
+        with self._lock:
+            self._prune()
+            used = sum(value for _, value in self._reservations)
+            if used + tokens <= self.safe_limit:
+                return 0.0
+            if not self._reservations:
+                return 60.0
+            return max(0.01, 60.0 - (self._clock() - self._reservations[0][0]))
+
     def reconcile_latest(self, reserved_tokens: int, actual_tokens: int | None) -> None:
         """Replace a pessimistic reservation with Groq's actual usage."""
         if actual_tokens is None:
@@ -178,17 +189,18 @@ class GroqProvider:
                 estimated_total_tokens = None
                 try:
                     messages, estimated_input_tokens, input_compacted = self._messages(active_prompt, payload, input_limit, force_compact=force_compact_input)
-                    estimated_total_tokens = estimated_input_tokens + max_output_tokens
-                    self._wait_for_tpm(agent, active_model, estimated_input_tokens, max_output_tokens, estimated_total_tokens, request_attempt)
+                    requested_output_tokens, estimated_total_tokens = self._reserve_available_tpm(
+                        agent, active_model, estimated_input_tokens, max_output_tokens, request_attempt,
+                    )
                     request = {
                         "model": active_model,
                         "messages": messages,
-                        "max_completion_tokens": max_output_tokens,
+                        "max_completion_tokens": requested_output_tokens,
                         "temperature": 0.2,
                         "response_format": {"type": "json_object"},
                         **self._reasoning_options(active_model),
                     }
-                    logger.info("llm_request_scheduled", extra={"provider": "groq", "agent": agent, "model": active_model, "primary_or_fallback": "fallback" if fallback_used else "primary", "fallback_used": fallback_used, "estimated_input_tokens": estimated_input_tokens, "requested_max_output_tokens": max_output_tokens, "estimated_total_tokens": estimated_total_tokens, "available_tpm": self._token_budget.available(), "input_compacted": input_compacted, "retry_number": transport_attempt})
+                    logger.info("llm_request_scheduled", extra={"provider": "groq", "agent": agent, "model": active_model, "primary_or_fallback": "fallback" if fallback_used else "primary", "fallback_used": fallback_used, "estimated_input_tokens": estimated_input_tokens, "configured_max_output_tokens": max_output_tokens, "requested_max_output_tokens": requested_output_tokens, "estimated_total_tokens": estimated_total_tokens, "available_tpm": self._token_budget.available(), "input_compacted": input_compacted, "retry_number": transport_attempt})
                     response = self.client.chat.completions.create(**request)
                     request_id = getattr(response, "_request_id", None)
                     choice = response.choices[0]
@@ -197,11 +209,11 @@ class GroqProvider:
                     usage = getattr(response, "usage", None)
                     self._token_budget.reconcile_latest(estimated_total_tokens, getattr(usage, "total_tokens", None))
                     response_details = self._response_details(content, choice, message, request_id, usage)
-                    logger.info("groq_response_received", extra={"provider": "groq", "agent": agent, "model": active_model, "configured_output_limit": max_output_tokens, **response_details})
+                    logger.info("groq_response_received", extra={"provider": "groq", "agent": agent, "model": active_model, "configured_output_limit": max_output_tokens, "requested_max_output_tokens": requested_output_tokens, **response_details})
                     if getattr(choice, "finish_reason", None) == "length":
                         empty_visible_content = not isinstance(content, str) or not content.strip()
                         event = "groq_reasoning_budget_exhausted" if empty_visible_content else "groq_output_budget_exhausted"
-                        logger.warning(event, extra={"provider": "groq", "agent": agent, "model": active_model, "attempt": request_attempt, "configured_output_limit": max_output_tokens, **self._response_details(content, choice, message, request_id, usage, include_preview=True)})
+                        logger.warning(event, extra={"provider": "groq", "agent": agent, "model": active_model, "attempt": request_attempt, "configured_output_limit": max_output_tokens, "requested_max_output_tokens": requested_output_tokens, **self._response_details(content, choice, message, request_id, usage, include_preview=True)})
                         if not incomplete_retried:
                             incomplete_retried = True
                             force_compact_input = True
@@ -218,7 +230,7 @@ class GroqProvider:
                         category = "llm_reasoning_budget_exhausted" if empty_visible_content else "llm_incomplete_response"
                         raise LLMProviderError("Groq exhausted the completion budget before returning visible JSON." if empty_visible_content else "Groq response was incomplete because it reached the output token limit.", category=category)
                     parsed = self._parse_json_response(content, agent, request_id, response_details, active_model)
-                    logger.info("llm_usage", extra={"provider": "groq", "agent": agent, "model": active_model, "estimated_input_tokens": estimated_input_tokens, "requested_max_output_tokens": max_output_tokens, "estimated_total_tokens": estimated_total_tokens, "actual_prompt_tokens": getattr(usage, "prompt_tokens", estimated_input_tokens), "actual_completion_tokens": getattr(usage, "completion_tokens", None), "actual_total_tokens": getattr(usage, "total_tokens", None), "finish_reason": getattr(choice, "finish_reason", None), "visible_content_exists": bool(isinstance(content, str) and content.strip()), "reasoning_content_exists": self._reasoning_content(message) is not None, "request_id": getattr(response, "_request_id", None)})
+                    logger.info("llm_usage", extra={"provider": "groq", "agent": agent, "model": active_model, "estimated_input_tokens": estimated_input_tokens, "configured_max_output_tokens": max_output_tokens, "requested_max_output_tokens": requested_output_tokens, "estimated_total_tokens": estimated_total_tokens, "actual_prompt_tokens": getattr(usage, "prompt_tokens", estimated_input_tokens), "actual_completion_tokens": getattr(usage, "completion_tokens", None), "actual_total_tokens": getattr(usage, "total_tokens", None), "finish_reason": getattr(choice, "finish_reason", None), "visible_content_exists": bool(isinstance(content, str) and content.strip()), "reasoning_content_exists": self._reasoning_content(message) is not None, "request_id": getattr(response, "_request_id", None)})
                     return parsed
                 except (StructuredOutputParseError, TypeError, KeyError, IndexError) as exc:
                     stage = getattr(exc, "stage", "response_content")
@@ -319,15 +331,21 @@ class GroqProvider:
             logger.warning("llm_output_budget_clamped", extra={"provider": "groq", "agent": agent, "requested_max_output_tokens": requested, "enforced_max_output_tokens": enforced})
         return enforced
 
-    def _wait_for_tpm(self, agent: str, model: str, estimated_input: int, requested_output: int, estimated_total: int, retry_number: int) -> None:
-        if estimated_total > settings.groq_safe_tpm_limit:
-            raise LLMProviderError("LLM request exceeds the safe TPM budget before it can be sent.", category="llm_provider_error")
+    def _reserve_available_tpm(self, agent: str, model: str, estimated_input: int, configured_output: int, retry_number: int) -> tuple[int, int]:
+        if estimated_input >= settings.groq_safe_tpm_limit:
+            raise LLMProviderError("LLM input alone exceeds the safe TPM budget before it can be sent.", category="llm_provider_error")
         while True:
-            delay = self._token_budget.reserve_or_delay(estimated_total)
-            if delay == 0:
-                return
-            logger.warning("llm_request_delayed", extra={"provider": "groq", "agent": agent, "model": model, "estimated_input_tokens": estimated_input, "requested_max_output_tokens": requested_output, "estimated_tokens": estimated_total, "available_tpm": self._token_budget.available(), "delay_seconds": round(delay, 3), "reason": "tpm_budget", "retry_number": retry_number})
-            self._sleep(delay)
+            available = self._token_budget.available()
+            requested_output = min(configured_output, max(0, available - estimated_input))
+            if requested_output:
+                estimated_total = estimated_input + requested_output
+                if self._token_budget.reserve_or_delay(estimated_total) == 0:
+                    return requested_output, estimated_total
+                continue
+            delay = self._token_budget.delay_for(estimated_input + 1)
+            poll_delay = min(delay, settings.groq_tpm_recheck_seconds)
+            logger.warning("llm_request_delayed", extra={"provider": "groq", "agent": agent, "model": model, "estimated_input_tokens": estimated_input, "configured_max_output_tokens": configured_output, "requested_max_output_tokens": 0, "estimated_tokens": estimated_input, "available_tpm": available, "delay_seconds": round(poll_delay, 3), "reason": "tpm_budget", "retry_number": retry_number})
+            self._sleep(poll_delay)
 
     @staticmethod
     def _messages(prompt: str, payload: dict, input_limit: int, *, force_compact: bool = False) -> tuple[list[dict[str, str]], int, bool]:
