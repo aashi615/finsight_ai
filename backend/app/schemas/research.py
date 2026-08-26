@@ -1,7 +1,8 @@
 from datetime import datetime
+import re
 from typing import Any, Literal
 from uuid import UUID
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 from app.models.research_job import ResearchJobStatus
 
 
@@ -89,6 +90,37 @@ class ResearchSynthesis(EvidenceBoundAnalysis):
 class ResearchRequest(BaseModel):
     ticker: str = Field(min_length=1, max_length=20)
     question: str = Field(min_length=5, max_length=2000)
+
+
+class ResearchPlan(BaseModel):
+    """Validated, non-persistent routing decision for a research request."""
+
+    model_config = ConfigDict(extra="forbid")
+    companies: list[str] = Field(min_length=1, max_length=10)
+    needs_market: StrictBool
+    needs_news: StrictBool
+    needs_documents: StrictBool
+    reasoning: str | None = Field(default=None, max_length=500)
+
+    @field_validator("companies")
+    @classmethod
+    def normalize_companies(cls, companies: list[str]) -> list[str]:
+        normalized = []
+        for company in companies:
+            ticker = company.strip()
+            if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,19}", ticker):
+                raise ValueError("Companies must contain uppercase ticker symbols.")
+            if ticker not in normalized:
+                normalized.append(ticker)
+        if not normalized:
+            raise ValueError("At least one company is required.")
+        return normalized
+
+    @model_validator(mode="after")
+    def requires_at_least_one_source(self):
+        if not any((self.needs_market, self.needs_news, self.needs_documents)):
+            raise ValueError("A research plan must select at least one source.")
+        return self
 
 
 class ResearchJobOut(BaseModel):

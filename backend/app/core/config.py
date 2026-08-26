@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     news_max_output_tokens: int = 1600
     market_max_output_tokens: int = 1400
     rag_max_output_tokens: int = 1200
+    planner_max_output_tokens: int = 300
     # Synthesis stays compact because it returns IDs rather than copied source
     # records, but has enough room for all prose fields and valid JSON.
     final_max_output_tokens: int = 1200

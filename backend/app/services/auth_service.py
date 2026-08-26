@@ -4,18 +4,31 @@ from app.core.exceptions import api_error
 from app.core.security import create_access_token, hash_password, verify_password
 from app.models.organization import Organization
 from app.models.user import Role, User
+from app.repositories.organization_repository import OrganizationRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import LoginRequest, SignupRequest
 
 
 class AuthService:
     users = UserRepository()
+    organizations = OrganizationRepository()
 
     def signup(self, db: Session, payload: SignupRequest) -> User:
         if self.users.get_by_email(db, str(payload.email)):
             raise api_error(409, "EMAIL_ALREADY_EXISTS", "An account with this email already exists.")
-        organization = Organization(name=payload.organization_name.strip())
-        user = User(name=payload.name.strip(), email=str(payload.email).lower(), password_hash=hash_password(payload.password), role=Role.ADMIN, organization=organization)
+        organization = self.organizations.get_by_name(db, payload.organization_name)
+        is_new_organization = organization is None
+        if is_new_organization:
+            organization = Organization(name=payload.organization_name.strip())
+        # Reusing a workspace name joins its shared tenant. The creator owns
+        # the workspace; later self-registered members get analyst access.
+        user = User(
+            name=payload.name.strip(),
+            email=str(payload.email).lower(),
+            password_hash=hash_password(payload.password),
+            role=Role.ADMIN if is_new_organization else Role.ANALYST,
+            organization=organization,
+        )
         db.add(user)
         try:
             db.commit()

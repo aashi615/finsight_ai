@@ -350,15 +350,16 @@ class MarketAnalystAgent:
     def __init__(self, llm: LLMProvider): self.llm = llm
     async def analyze(self, context: dict) -> MarketAnalysis:
         rows = context["market"]
+        tickers = context.get("company_tickers", {})
         # Compact, evenly-spaced price points retain the trend without shipping a
         # month of OHLCV rows to the model.
         rows = _sample(rows, settings.market_history_points_limit)
-        evidence = [Evidence(source_type="MARKET", source_id=str(row.id), snippet=f"{row.timestamp.date()}: close {row.close}") for row in rows]
+        evidence = [Evidence(source_type="MARKET", source_id=str(row.id), snippet=f"{tickers.get(str(getattr(row, 'company_id', '')), '')} {row.timestamp.date()}: close {row.close}".strip()) for row in rows]
         if not rows:
             return MarketAnalysis(summary="Historical market-price data is unavailable from the configured provider. Do not infer or fabricate historical price performance.", metrics={}, signals=[], evidence=[])
         closes = [float(row.close) for row in rows]
         metrics = {"start_close": closes[0], "end_close": closes[-1], "price_change": closes[-1] - closes[0], "price_change_percent": ((closes[-1] - closes[0]) / closes[0] * 100) if closes[0] else 0.0, "high_close": max(closes), "low_close": min(closes)}
-        payload = {"question": context["question"][:500], "market": [{"timestamp": row.timestamp.date().isoformat(), "close": str(row.close), "volume": row.volume} for row in rows], "calculated_metrics": metrics, "evidence": [item.model_dump() for item in evidence]}
+        payload = {"question": context["question"][:500], "market": [{"ticker": tickers.get(str(getattr(row, "company_id", ""))), "timestamp": row.timestamp.date().isoformat(), "close": str(row.close), "volume": row.volume} for row in rows], "calculated_metrics": metrics, "evidence": [item.model_dump() for item in evidence]}
         result = await self._complete(MarketAnalysis, market.PROMPT, payload, require_evidence=True, supplied_evidence=evidence)
         return result.model_copy(update={"metrics": metrics})
     async def _complete(self, model, prompt, payload, *, require_evidence: bool = False, supplied_evidence: list[Evidence] | None = None):
@@ -375,11 +376,12 @@ class NewsAnalystAgent:
     def __init__(self, llm: LLMProvider): self.llm = llm
     async def analyze(self, context: dict) -> NewsAnalysis:
         articles = context["news"]
+        tickers = context.get("company_tickers", {})
         evidence = [Evidence(source_type="NEWS", source_id=str(article.id), snippet=article.title, url=article.url) for article in articles]
         if not articles:
             return NewsAnalysis(summary="No recent news is available.", themes=[], signals=[], evidence=[])
         evidence = evidence[:settings.news_article_limit]
-        payload = {"question": context["question"][:500], "articles": [{"source_id": str(article.id), "title": article.title[:180], "summary": (article.summary or "")[:settings.news_article_snippet_chars], "published_at": article.published_at.date().isoformat()} for article in articles[:settings.news_article_limit]], "evidence": [item.model_dump() for item in evidence]}
+        payload = {"question": context["question"][:500], "articles": [{"ticker": tickers.get(str(getattr(article, "company_id", ""))), "source_id": str(article.id), "title": article.title[:180], "summary": (article.summary or "")[:settings.news_article_snippet_chars], "published_at": article.published_at.date().isoformat()} for article in articles[:settings.news_article_limit]], "evidence": [item.model_dump() for item in evidence]}
         try:
             return await _complete_validated(self.llm, NewsAnalysis, news.PROMPT, payload, agent="news_analyst", max_output_tokens=settings.news_max_output_tokens, require_evidence=True, supplied_evidence=evidence)
         except (LLMProviderError, AgentFailure) as exc:

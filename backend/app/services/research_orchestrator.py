@@ -10,8 +10,9 @@ from app.models.company import Company
 from app.repositories.research_report_repository import ResearchReportRepository
 from app.models.user import User
 from app.repositories.research_job_repository import ResearchJobRepository
-from app.schemas.research import ResearchRequest, ResearchSynthesis
+from app.schemas.research import ResearchPlan, ResearchRequest, ResearchSynthesis
 from app.services.agents import AgentFailure, DocumentRagAgent, MarketAnalystAgent, NewsAnalystAgent, ResearchSynthesizer
+from app.services.query_planner import QueryPlanner
 from app.services.rag_service import RagService
 from app.services.research_service import ResearchService
 
@@ -19,13 +20,14 @@ logger = logging.getLogger(__name__)
 
 
 class ResearchOrchestrator:
-    def __init__(self, research_service: ResearchService, rag_service: RagService, market_agent: MarketAnalystAgent, news_agent: NewsAnalystAgent, document_agent: DocumentRagAgent, synthesizer: ResearchSynthesizer):
+    def __init__(self, research_service: ResearchService, rag_service: RagService, market_agent: MarketAnalystAgent, news_agent: NewsAnalystAgent, document_agent: DocumentRagAgent, synthesizer: ResearchSynthesizer, query_planner: QueryPlanner | None = None):
         self.research_service = research_service
         self.rag_service = rag_service
         self.market_agent = market_agent
         self.news_agent = news_agent
         self.document_agent = document_agent
         self.synthesizer = synthesizer
+        self.query_planner = query_planner or QueryPlanner(news_agent.llm)
         self.jobs = ResearchJobRepository()
         self.reports = ResearchReportRepository()
 
@@ -83,33 +85,45 @@ class ResearchOrchestrator:
         return messages.get(category, "Research processing failed.")
 
     async def _run_agents(self, db: Session, job: ResearchJob, company) -> tuple[ResearchSynthesis, dict]:
+        plan = await self.query_planner.analyze(job.question, company.ticker)
+        selected_agents = self.query_planner.selected_agents(plan)
+        skipped_agents = self.query_planner.skipped_agents(plan)
+        logger.info("selected_agents", extra={"job_id": str(job.id), "company": company.ticker, "selected_agents": selected_agents})
+        logger.info("skipped_agents", extra={"job_id": str(job.id), "company": company.ticker, "skipped_agents": skipped_agents})
+        companies = self._resolve_plan_companies(db, company, plan)
         # Fetch sync providers off the event loop; yfinance is blocking.
         to_date = datetime.now(timezone.utc).date()
         from_date = to_date - timedelta(days=30)
-        # Data providers are independent sources. A Finnhub/Yahoo outage must
-        # not discard usable news or tenant-document evidence for this job.
-        try:
-            _, market_rows = await self.research_service.get_market_data_async(db, company.ticker, from_date, to_date)
-        except HTTPException as exc:
-            if not self._is_market_data_failure(exc):
-                raise
-            market_rows = []
-            logger.warning("research_source_unavailable", extra={"job_id": str(job.id), "company": company.ticker, "agent": "market_analyst", "error_category": "market_data_provider"})
-        try:
-            _, news_rows = self.research_service.get_news(db, company.ticker, from_date, to_date, limit=10)
-        except HTTPException as exc:
-            if not self._is_market_data_failure(exc):
-                raise
-            news_rows = []
-            logger.warning("research_source_unavailable", extra={"job_id": str(job.id), "company": company.ticker, "agent": "news_analyst", "error_category": "news_provider"})
-        context = {"company": company, "market": market_rows, "news": news_rows, "question": job.question}
-        chunks = self.rag_service.retrieve(db, job.organization_id, job.question, company.id, limit=3)
+        market_rows, news_rows, chunks = [], [], []
+        # Fetch only sources selected by the plan. Branches remain sequential,
+        # matching the existing provider TPM scheduler rather than bypassing it
+        # with an uncontrolled gather burst.
+        for planned_company in companies:
+            if plan.needs_market:
+                try:
+                    _, rows = await self.research_service.get_market_data_async(db, planned_company.ticker, from_date, to_date)
+                    market_rows.extend(rows)
+                except HTTPException as exc:
+                    if not self._is_market_data_failure(exc):
+                        raise
+                    logger.warning("research_source_unavailable", extra={"job_id": str(job.id), "company": planned_company.ticker, "agent": "market_analyst", "error_category": "market_data_provider"})
+            if plan.needs_news:
+                try:
+                    _, rows = self.research_service.get_news(db, planned_company.ticker, from_date, to_date, limit=10)
+                    news_rows.extend(rows)
+                except HTTPException as exc:
+                    if not self._is_market_data_failure(exc):
+                        raise
+                    logger.warning("research_source_unavailable", extra={"job_id": str(job.id), "company": planned_company.ticker, "agent": "news_analyst", "error_category": "news_provider"})
+            if plan.needs_documents:
+                chunks.extend(self.rag_service.retrieve(db, job.organization_id, job.question, planned_company.id, limit=3))
+        context = {"company": company, "companies": companies, "company_tickers": {str(item.id): item.ticker for item in companies}, "market": market_rows, "news": news_rows, "question": job.question}
         # Logical branches are independent. They are deliberately scheduled one
         # at a time; the provider's rolling TPM manager then remains the single
         # source of truth and a gather burst cannot exhaust Groq's 8k TPM limit.
-        market_result = await self._run_branch(job, company.ticker, "market_analyst", self.market_agent.analyze(context))
-        news_result = await self._run_branch(job, company.ticker, "news_analyst", self.news_agent.analyze(context))
-        document_result = await self._run_branch(job, company.ticker, "document_rag_agent", self.document_agent.analyze(job.question, chunks))
+        market_result = await self._run_branch(job, company.ticker, "market_analyst", self.market_agent.analyze(context)) if plan.needs_market else None
+        news_result = await self._run_branch(job, company.ticker, "news_analyst", self.news_agent.analyze(context)) if plan.needs_news else None
+        document_result = await self._run_branch(job, company.ticker, "document_rag_agent", self.document_agent.analyze(job.question, chunks)) if plan.needs_documents else None
         summaries = {
             "news_summary": news_result.model_dump(mode="json") if news_result else None,
             "market_summary": market_result.model_dump(mode="json") if market_result else None,
@@ -121,6 +135,22 @@ class ResearchOrchestrator:
         db.commit()
         final_result = await self.synthesizer.synthesize(market_result, news_result, document_result)
         return final_result, summaries
+
+    def _resolve_plan_companies(self, db: Session, primary_company, plan: ResearchPlan) -> list:
+        """Resolve planned comparison tickers while preserving a safe primary fallback."""
+        resolved = []
+        for ticker in plan.companies:
+            if ticker == primary_company.ticker:
+                candidate = primary_company
+            else:
+                try:
+                    candidate = self.research_service.resolve_company(db, ticker)
+                except Exception as exc:
+                    logger.warning("planned_company_unavailable", extra={"company": ticker, "error_type": type(exc).__name__, "error_category": getattr(exc, "category", "company_resolution"), "error_detail": str(exc)})
+                    continue
+            if all(candidate.id != item.id for item in resolved):
+                resolved.append(candidate)
+        return resolved or [primary_company]
 
     async def _run_branch(self, job: ResearchJob, ticker: str, agent_name: str, work):
         try:

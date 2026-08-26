@@ -24,6 +24,8 @@ class FakeLLMProvider:
         self.calls.append(prompt)
         if self.malformed:
             return {"not": "an analysis"}
+        if "query planner" in prompt:
+            return {"companies": [payload["fallback_ticker"]], "needs_market": True, "needs_news": True, "needs_documents": True, "reasoning": "Default test plan."}
         evidence = payload.get("evidence") or [item for summary in (payload.get("news_summary"), payload.get("market_summary"), payload.get("rag_summary")) if summary for item in summary.get("evidence", [])]
         claim = [{"claim": "Based on available data, this is a monitored signal.", "evidence": evidence[:1]}] if evidence else []
         if "market analyst" in prompt:
