@@ -112,6 +112,17 @@ def test_analysis_rejects_claim_with_unknown_evidence():
         MarketAnalysis(summary="test", metrics={}, signals=[{"claim": "unsupported", "evidence": [Evidence(source_type="MARKET", source_id="wrong", snippet="wrong").model_dump()]}], evidence=[])
 
 
+def test_synthesis_rejects_risk_that_is_not_cited_in_top_level_evidence():
+    with pytest.raises(ValueError, match="Synthesis claims must cite evidence"):
+        from app.schemas.research import ResearchSynthesis
+        ResearchSynthesis(
+            executive_summary="summary", company_overview="overview", market_analysis="market", news_analysis="news",
+            key_risks=[{"claim": "unsupported", "evidence": [{"source_type": "NEWS", "source_id": "wrong", "snippet": "wrong"}]}],
+            key_opportunities=[], evidence=[{"source_type": "NEWS", "source_id": "right", "snippet": "right"}],
+            confidence=0.5, generated_at=datetime.now(timezone.utc),
+        )
+
+
 def test_market_agent_valid_json_parses_to_market_analysis():
     class ValidLLM:
         async def complete_json(self, *args, **kwargs):
@@ -137,7 +148,7 @@ def test_market_agent_schema_invalid_json_has_clear_validation_error():
         async def complete_json(self, *args, **kwargs):
             return {"agent": "market_analyst", "summary": "valid", "metrics": "not an object", "signals": [], "evidence": []}
 
-    with pytest.raises(AgentFailure, match="invalid fields: metrics") as error:
+    with pytest.raises(AgentFailure, match="invalid fields: metrics:") as error:
         asyncio.run(MarketAnalystAgent(SchemaInvalidLLM())._complete(MarketAnalysis, "prompt", {}))
     assert error.value.category == "llm_invalid_response"
 

@@ -23,8 +23,8 @@ def _validate(model, payload, *, agent: str | None = None):
         logger.info("groq_schema_validation_succeeded", extra={"agent": agent, "response_parsing_stage": "pydantic_validation"})
         return result
     except ValidationError as exc:
-        locations = [".".join(str(part) for part in error["loc"]) for error in exc.errors()[:3]]
-        detail = ", ".join(locations) or "unknown field"
+        failures = [f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']} ({error['type']})" for error in exc.errors()[:3]]
+        detail = "; ".join(failures) or "unknown field"
         logger.warning("groq_schema_validation_failed", extra={"agent": agent, "response_parsing_stage": "pydantic_validation", "validation_failure_fields": detail})
         raise AgentFailure(f"LLM returned invalid structured analysis (invalid fields: {detail}).", category="llm_invalid_response") from exc
 

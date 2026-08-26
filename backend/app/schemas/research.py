@@ -71,7 +71,10 @@ class ResearchSynthesis(EvidenceBoundAnalysis):
 
     @model_validator(mode="after")
     def synthesis_claims_must_cite_evidence(self):
-        self.claims_must_use_listed_evidence()
+        allowed = {evidence_identity(item) for item in self.evidence}
+        for claim in [*self.key_risks, *self.key_opportunities]:
+            if not {evidence_identity(item) for item in claim.evidence}.issubset(allowed):
+                raise ValueError("Synthesis claims must cite evidence included in the synthesis.")
         return self
 
 
