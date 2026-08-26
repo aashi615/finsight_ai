@@ -9,7 +9,7 @@ from app.api.v1.research import get_orchestrator
 from app.core.database import get_db
 from app.providers.base import ProviderError
 from app.schemas.research import DocumentAnalysis, Evidence, MarketAnalysis, NewsAnalysis, ResearchSynthesis
-from app.services.agents import AgentFailure, DocumentRagAgent, MarketAnalystAgent, NewsAnalystAgent, ResearchSynthesizer, _normalize_synthesis_response, _validate
+from app.services.agents import AgentFailure, DocumentRagAgent, MarketAnalystAgent, NewsAnalystAgent, ResearchSynthesizer, _complete_validated, _normalize_synthesis_response, _validate
 from app.services.rag_service import RagService
 from app.services.research_orchestrator import ResearchOrchestrator
 from app.services.research_service import ResearchService
@@ -143,6 +143,40 @@ def test_market_claim_matching_supplied_evidence_is_added_to_top_level_evidence(
     assert result.evidence == [evidence]
 
 
+@pytest.mark.parametrize(
+    ("model", "agent", "payload"),
+    [
+        (MarketAnalysis, "market_analyst", {"agent": "market_analyst", "summary": "Valid.", "metrics": {}, "signals": [], "evidence": []}),
+        (NewsAnalysis, "news_analyst", {"agent": "news_analyst", "summary": "Valid.", "themes": [], "signals": [], "evidence": []}),
+        (DocumentAnalysis, "document_rag_agent", {"agent": "document_rag_agent", "summary": "Valid.", "findings": [], "evidence": []}),
+    ],
+)
+def test_specialist_claim_with_exact_canonical_evidence_is_normalized(model, agent, payload):
+    evidence = Evidence(source_type="DOCUMENT" if model is DocumentAnalysis else "NEWS", source_id="canonical-1", snippet="Canonical evidence")
+    claim_field = "findings" if model is DocumentAnalysis else "signals"
+    response = {**payload, claim_field: [{"claim": "Supported.", "evidence": [evidence.model_dump()]}]}
+
+    class ClaimOnlyLLM:
+        async def complete_json(self, *args, **kwargs):
+            return response
+
+    result = asyncio.run(_complete_validated(ClaimOnlyLLM(), model, "prompt", {"evidence": [evidence.model_dump()]}, agent=agent, max_output_tokens=100, require_evidence=True, supplied_evidence=[evidence]))
+    assert result.evidence == [evidence]
+    assert getattr(result, claim_field)[0].evidence == [evidence]
+
+
+def test_specialist_invented_evidence_is_rejected_before_any_normalization():
+    canonical = Evidence(source_type="NEWS", source_id="canonical-1", snippet="Canonical evidence")
+    invented = Evidence(source_type="NEWS", source_id="invented-1", snippet="Invented evidence")
+
+    class InventedLLM:
+        async def complete_json(self, *args, **kwargs):
+            return {"agent": "news_analyst", "summary": "Invalid.", "themes": [], "signals": [{"claim": "Unsupported.", "evidence": [invented.model_dump()]}], "evidence": []}
+
+    with pytest.raises(AgentFailure, match="Claims must cite evidence included in the analysis"):
+        asyncio.run(_complete_validated(InventedLLM(), NewsAnalysis, "prompt", {"evidence": [canonical.model_dump()]}, agent="news_analyst", max_output_tokens=100, require_evidence=True, supplied_evidence=[canonical]))
+
+
 def test_deterministic_market_fallback_never_accepts_an_invented_claim():
     supplied = Evidence(source_type="MARKET", source_id="market-1", snippet="Close 100")
     invented = Evidence(source_type="MARKET", source_id="invented", snippet="Altered")
@@ -161,6 +195,7 @@ def test_synthesis_rejects_risk_that_is_not_cited_in_top_level_evidence():
         from app.schemas.research import ResearchSynthesis
         ResearchSynthesis(
             executive_summary="summary", company_overview="overview", market_analysis="market", news_analysis="news",
+            growth_catalysts=[], competitive_landscape="competition", valuation="valuation", conclusion="conclusion",
             key_risks=[{"claim": "unsupported", "evidence": [{"source_type": "NEWS", "source_id": "wrong", "snippet": "wrong"}]}],
             key_opportunities=[], evidence=[{"source_type": "NEWS", "source_id": "right", "snippet": "right"}],
             confidence=0.5, generated_at=datetime.now(timezone.utc),
@@ -178,7 +213,7 @@ def test_synthesis_rejects_risk_that_is_not_cited_in_top_level_evidence():
 )
 def test_synthesizer_normalizes_only_string_array_fields_to_evidence_backed_arrays(risks, opportunities, expected_risks, expected_opportunities):
     payload = {
-        "executive_summary": "Summary", "company_overview": "Overview", "market_analysis": "Market", "news_analysis": "News",
+        "executive_summary": "Summary", "company_overview": "Overview", "market_analysis": "Market", "news_analysis": "News", "growth_catalysts": [], "competitive_landscape": "Competitive.", "valuation": "Valuation.", "conclusion": "Conclusion.",
         "key_risks": risks, "key_opportunities": opportunities,
         "evidence": [{"source_type": "NEWS", "source_id": "news_001", "snippet": "Evidence"}],
         "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -190,7 +225,7 @@ def test_synthesizer_normalizes_only_string_array_fields_to_evidence_backed_arra
 
 def test_synthesizer_normalization_does_not_coerce_unrelated_malformed_fields():
     payload = {
-        "executive_summary": ["not text"], "company_overview": "Overview", "market_analysis": "Market", "news_analysis": "News",
+        "executive_summary": ["not text"], "company_overview": "Overview", "market_analysis": "Market", "news_analysis": "News", "growth_catalysts": [], "competitive_landscape": "Competitive.", "valuation": "Valuation.", "conclusion": "Conclusion.",
         "key_risks": "Risk", "key_opportunities": [],
         "evidence": [{"source_type": "NEWS", "source_id": "news_001", "snippet": "Evidence"}],
         "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -208,8 +243,22 @@ def test_synthesis_schema_requires_source_id_and_snippet(evidence):
     with pytest.raises(ValueError):
         ResearchSynthesis(
             executive_summary="summary", company_overview="overview", market_analysis="market", news_analysis="news",
+            growth_catalysts=[], competitive_landscape="competition", valuation="valuation", conclusion="conclusion",
             key_risks=[], key_opportunities=[], evidence=evidence, confidence=0.5, generated_at=datetime.now(timezone.utc),
         )
+
+
+@pytest.mark.parametrize("field", ["growth_catalysts", "key_risks", "competitive_landscape", "valuation", "conclusion", "evidence"])
+def test_synthesis_schema_requires_every_public_final_field(field):
+    payload = {
+        "executive_summary": "summary", "company_overview": "overview", "market_analysis": "market", "news_analysis": "news",
+        "growth_catalysts": [], "key_risks": [], "key_opportunities": [], "competitive_landscape": "competition",
+        "valuation": "valuation", "conclusion": "conclusion", "evidence": [{"source_type": "NEWS", "source_id": "news-1", "snippet": "canonical"}],
+        "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    payload.pop(field)
+    with pytest.raises(AgentFailure, match="invalid structured analysis"):
+        _validate(ResearchSynthesis, payload, agent="research_synthesizer")
 
 
 def test_market_agent_valid_json_parses_to_market_analysis():
@@ -276,7 +325,7 @@ def test_final_synthesis_receives_only_independent_compact_summaries():
         async def complete_json(self, prompt, payload, **kwargs):
             self.payload = payload
             manifest_id = payload["evidence_manifest"][0]["evidence_id"]
-            return {"executive_summary": "Based on available data.", "company_overview": "Available data.", "market_analysis": "Available data.", "news_analysis": "Available data.", "key_risks": [], "key_opportunities": [], "evidence_ids": [manifest_id], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
+            return {"executive_summary": "Based on available data.", "company_overview": "Available data.", "market_analysis": "Available data.", "news_analysis": "Available data.", "growth_catalysts": [], "competitive_landscape": "Competitive.", "valuation": "Valuation.", "conclusion": "Conclusion.", "key_risks": [], "key_opportunities": [], "evidence_ids": [manifest_id], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
 
     evidence = Evidence(source_type="NEWS", source_id="n1", snippet="compact", url="https://example.test")
     llm = CapturingLLM()
@@ -292,7 +341,7 @@ def test_synthesis_accepts_manifest_backed_evidence_and_restores_canonical_value
     class ManifestLLM:
         async def complete_json(self, prompt, payload, **kwargs):
             entry = next(item for item in payload["evidence_manifest"] if item["evidence_id"].startswith(prefix))
-            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market.", "news_analysis": "News.", "key_risks": [{"claim": "Risk.", "evidence_ids": [entry["evidence_id"]]}], "key_opportunities": [], "evidence_ids": [entry["evidence_id"]], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
+            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market.", "news_analysis": "News.", "growth_catalysts": [], "competitive_landscape": "Competitive.", "valuation": "Valuation.", "conclusion": "Conclusion.", "key_risks": [{"claim": "Risk.", "evidence_ids": [entry["evidence_id"]]}], "key_opportunities": [], "evidence_ids": [entry["evidence_id"]], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
 
     evidence = Evidence(source_type=source_type, source_id="source-1", snippet="Canonical title", url="https://example.test/source")
     news = NewsAnalysis(summary="news", themes=[], signals=[], evidence=[evidence]) if source_type == "NEWS" else None
@@ -307,7 +356,7 @@ def test_synthesis_discards_fabricated_manifest_reference_and_uses_safe_fallback
     class InvalidEvidenceLLM:
         async def complete_json(self, prompt, payload, **kwargs):
             copied = {"evidence_id": bad_reference, "source_type": "NEWS", "source_id": "source-1", "snippet": "Canonical title", "url": "https://example.test/source"}
-            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market.", "news_analysis": "News.", "key_risks": [], "key_opportunities": [], "evidence": [copied], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
+            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market.", "news_analysis": "News.", "growth_catalysts": [], "competitive_landscape": "Competitive.", "valuation": "Valuation.", "conclusion": "Conclusion.", "key_risks": [], "key_opportunities": [], "evidence": [copied], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
 
     news = NewsAnalysis(summary="news", themes=[], signals=[], evidence=[Evidence(source_type="NEWS", source_id="source-1", snippet="Canonical title", url="https://example.test/source")])
     result = asyncio.run(ResearchSynthesizer(InvalidEvidenceLLM()).synthesize(None, news, None))
@@ -321,7 +370,7 @@ def test_synthesis_discards_duplicate_or_unavailable_evidence_reference():
             original = next(summary["evidence"][0] for key, summary in payload.items() if key.endswith("_summary") and summary)
             copied = {"evidence_id": "news_001", **original}
             unavailable = {"evidence_id": "rag_001", **original}
-            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market.", "news_analysis": "News.", "key_risks": [{"claim": "Risk.", "evidence": [unavailable]}], "key_opportunities": [], "evidence": [copied, copied], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
+            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market.", "news_analysis": "News.", "growth_catalysts": [], "competitive_landscape": "Competitive.", "valuation": "Valuation.", "conclusion": "Conclusion.", "key_risks": [{"claim": "Risk.", "evidence": [unavailable]}], "key_opportunities": [], "evidence": [copied, copied], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
 
     news = NewsAnalysis(summary="news", themes=[], signals=[], evidence=[Evidence(source_type="NEWS", source_id="source-1", snippet="Canonical title")])
     result = asyncio.run(ResearchSynthesizer(InvalidEvidenceLLM()).synthesize(None, news, None))
@@ -335,7 +384,7 @@ def test_synthesis_uses_valid_claim_evidence_when_legacy_branch_top_level_eviden
             assert payload["evidence_manifest"][0]["evidence_id"] == "news_001"
             source = payload["news_summary"]["evidence"][0]
             cited = {"evidence_id": "news_001", **source}
-            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market unavailable.", "news_analysis": "News available.", "key_risks": [], "key_opportunities": [], "evidence": [cited], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
+            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market unavailable.", "news_analysis": "News available.", "growth_catalysts": [], "competitive_landscape": "Competitive.", "valuation": "Valuation.", "conclusion": "Conclusion.", "key_risks": [], "key_opportunities": [], "evidence": [cited], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
 
     evidence = Evidence(source_type="NEWS", source_id="news-1", snippet="News evidence", url="https://example.test/news")
     validated = NewsAnalysis(summary="news", themes=[], signals=[{"claim": "Signal", "evidence": [evidence.model_dump()]}], evidence=[evidence])
@@ -351,7 +400,7 @@ def test_synthesis_accepts_manifest_source_id_and_restores_persisted_evidence():
         async def complete_json(self, prompt, payload, **kwargs):
             entry = payload["evidence_manifest"][0]
             cited = {"source_type": entry["source_type"], "source_id": entry["evidence_id"], "snippet": entry["title"], "url": entry["source"]}
-            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market.", "news_analysis": "News.", "key_risks": [], "key_opportunities": [], "evidence": [cited], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
+            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market.", "news_analysis": "News.", "growth_catalysts": [], "competitive_landscape": "Competitive.", "valuation": "Valuation.", "conclusion": "Conclusion.", "key_risks": [], "key_opportunities": [], "evidence": [cited], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
 
     original = Evidence(source_type="NEWS", source_id="persisted-news-uuid", snippet="Canonical news", url="https://example.test/news")
     result = asyncio.run(ResearchSynthesizer(ManifestLLM()).synthesize(None, NewsAnalysis(summary="news", themes=[], signals=[], evidence=[original]), None))
@@ -362,7 +411,7 @@ def test_synthesis_resolves_id_only_citations_to_canonical_metadata():
     class IdOnlyLLM:
         async def complete_json(self, prompt, payload, **kwargs):
             entry = payload["evidence_manifest"][0]
-            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market.", "news_analysis": "News.", "key_risks": [{"claim": "Risk.", "evidence_ids": [entry["evidence_id"]]}], "key_opportunities": [], "evidence_ids": [entry["evidence_id"]], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
+            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market.", "news_analysis": "News.", "growth_catalysts": [], "competitive_landscape": "Competitive.", "valuation": "Valuation.", "conclusion": "Conclusion.", "key_risks": [{"claim": "Risk.", "evidence_ids": [entry["evidence_id"]]}], "key_opportunities": [], "evidence_ids": [entry["evidence_id"]], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
 
     source = Evidence(source_type="NEWS", source_id="persisted-news", snippet="Canonical title", url="https://example.test/news")
     result = asyncio.run(ResearchSynthesizer(IdOnlyLLM()).synthesize(None, NewsAnalysis(summary="news", themes=[], signals=[], evidence=[source]), None))
@@ -379,8 +428,8 @@ def test_synthesis_uses_800_450_350_stages_and_keeps_only_manifest_evidence():
             self.budgets.append(kwargs["max_output_tokens"])
             evidence_id = payload["evidence_manifest"][0]["evidence_id"]
             if len(self.budgets) < 3:
-                return {"executive_summary": "Bad", "company_overview": "Bad", "market_analysis": "Bad", "news_analysis": "Bad", "key_risks": [], "key_opportunities": [], "evidence_ids": ["invented_001"], "confidence": 0.1, "generated_at": datetime.now(timezone.utc).isoformat()}
-            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market.", "news_analysis": "News.", "key_risks": [], "key_opportunities": [], "evidence_ids": [evidence_id], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
+                return {"executive_summary": "Bad", "company_overview": "Bad", "market_analysis": "Bad", "news_analysis": "Bad", "growth_catalysts": [], "competitive_landscape": "Competitive.", "valuation": "Valuation.", "conclusion": "Conclusion.", "key_risks": [], "key_opportunities": [], "evidence_ids": ["invented_001"], "confidence": 0.1, "generated_at": datetime.now(timezone.utc).isoformat()}
+            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market.", "news_analysis": "News.", "growth_catalysts": [], "competitive_landscape": "Competitive.", "valuation": "Valuation.", "conclusion": "Conclusion.", "key_risks": [], "key_opportunities": [], "evidence_ids": [evidence_id], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
 
     source = Evidence(source_type="NEWS", source_id="source-1", snippet="Canonical")
     llm = StagedLLM()
@@ -392,7 +441,7 @@ def test_synthesis_uses_800_450_350_stages_and_keeps_only_manifest_evidence():
 def test_synthesis_discards_invalid_manifest_source_id():
     class InvalidManifestLLM:
         async def complete_json(self, prompt, payload, **kwargs):
-            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market.", "news_analysis": "News.", "key_risks": [], "key_opportunities": [], "evidence_ids": ["news_999"], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
+            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market.", "news_analysis": "News.", "growth_catalysts": [], "competitive_landscape": "Competitive.", "valuation": "Valuation.", "conclusion": "Conclusion.", "key_risks": [], "key_opportunities": [], "evidence_ids": ["news_999"], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
 
     source = Evidence(source_type="NEWS", source_id="persisted-news", snippet="Canonical")
     result = asyncio.run(ResearchSynthesizer(InvalidManifestLLM()).synthesize(None, NewsAnalysis(summary="news", themes=[], signals=[], evidence=[source]), None))

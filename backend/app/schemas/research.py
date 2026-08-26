@@ -67,8 +67,12 @@ class ResearchSynthesis(EvidenceBoundAnalysis):
     company_overview: str
     market_analysis: str
     news_analysis: str
+    growth_catalysts: list[EvidenceBackedClaim]
     key_risks: list[EvidenceBackedClaim]
     key_opportunities: list[EvidenceBackedClaim]
+    competitive_landscape: str
+    valuation: str
+    conclusion: str
     evidence: list[Evidence] = Field(min_length=1)
     confidence: float = Field(ge=0, le=1)
     generated_at: datetime
@@ -76,7 +80,7 @@ class ResearchSynthesis(EvidenceBoundAnalysis):
     @model_validator(mode="after")
     def synthesis_claims_must_cite_evidence(self):
         allowed = {evidence_identity(item) for item in self.evidence}
-        for claim in [*self.key_risks, *self.key_opportunities]:
+        for claim in [*self.growth_catalysts, *self.key_risks, *self.key_opportunities]:
             if not {evidence_identity(item) for item in claim.evidence}.issubset(allowed):
                 raise ValueError("Synthesis claims must cite evidence included in the synthesis.")
         return self

@@ -125,7 +125,7 @@ def _canonical_synthesis_evidence(result: ResearchSynthesis, manifest: dict[str,
         return item.evidence_id or item.source_id
 
     returned_ids = [manifest_id(item) for item in result.evidence]
-    claim_items = [*result.key_risks, *result.key_opportunities]
+    claim_items = [*result.growth_catalysts, *result.key_risks, *result.key_opportunities]
     claim_ids = [manifest_id(item) for claim in claim_items for item in claim.evidence]
     unsupported = sorted({item for item in [*returned_ids, *claim_ids] if not item or item not in manifest})
     duplicates = sorted({item for item in returned_ids if item and returned_ids.count(item) > 1})
@@ -150,8 +150,9 @@ def _canonical_synthesis_evidence(result: ResearchSynthesis, manifest: dict[str,
         return [manifest[manifest_id(item)] for item in items]
 
     risks = [claim.model_copy(update={"evidence": canonical(claim.evidence)}) for claim in result.key_risks]
+    catalysts = [claim.model_copy(update={"evidence": canonical(claim.evidence)}) for claim in result.growth_catalysts]
     opportunities = [claim.model_copy(update={"evidence": canonical(claim.evidence)}) for claim in result.key_opportunities]
-    return result.model_copy(update={"evidence": canonical(result.evidence), "key_risks": risks, "key_opportunities": opportunities})
+    return result.model_copy(update={"evidence": canonical(result.evidence), "growth_catalysts": catalysts, "key_risks": risks, "key_opportunities": opportunities})
 
 
 def _normalize_synthesis_response(payload: dict) -> dict:
@@ -169,7 +170,7 @@ def _normalize_synthesis_response(payload: dict) -> dict:
     if not isinstance(top_level_evidence, list) or not top_level_evidence:
         return payload
     normalized = dict(payload)
-    for field in ("key_risks", "key_opportunities"):
+    for field in ("growth_catalysts", "key_risks", "key_opportunities"):
         value = normalized.get(field)
         if isinstance(value, str) and value.strip():
             normalized[field] = [{"claim": value.strip(), "evidence": [top_level_evidence[0]]}]
@@ -202,7 +203,7 @@ def _resolve_synthesis_evidence_ids(payload: dict, manifest: dict[str, Evidence]
     normalized = dict(payload)
     top_ids, top_evidence = resolve_ids(normalized.pop("evidence_ids", None), field="evidence_ids", require_one=True)
     normalized["evidence"] = top_evidence
-    for field in ("key_risks", "key_opportunities"):
+    for field in ("growth_catalysts", "key_risks", "key_opportunities"):
         claims = normalized.get(field)
         if not isinstance(claims, list):
             continue
@@ -249,7 +250,7 @@ def _restore_manifest_evidence(payload: dict, manifest: dict[str, Evidence]) -> 
     top_level = resolve_list(normalized.get("evidence"))
     normalized["evidence"] = top_level
     cited = []
-    for field in ("key_risks", "key_opportunities"):
+    for field in ("growth_catalysts", "key_risks", "key_opportunities"):
         claims = normalized.get(field)
         if not isinstance(claims, list):
             continue
@@ -300,8 +301,12 @@ def _deterministic_synthesis(analyses: list, manifest: dict[str, Evidence]) -> R
         company_overview="Company-specific interpretation is unavailable because the final synthesis model did not return a valid response.",
         market_analysis=by_type.get("MarketAnalysis", "Historical market-price data could not be assessed from available sources."),
         news_analysis=by_type.get("NewsAnalysis", "No usable recent-news analysis was available."),
+        growth_catalysts=[],
         key_risks=[],
         key_opportunities=[],
+        competitive_landscape="Competitive positioning could not be assessed because the final synthesis model did not return a valid response.",
+        valuation="Valuation could not be assessed because the final synthesis model did not return a valid response.",
+        conclusion="Based on available data, no further unsupported conclusion is provided.",
         evidence=list(manifest.values()),
         confidence=0.2,
         generated_at=datetime.now(timezone.utc),
