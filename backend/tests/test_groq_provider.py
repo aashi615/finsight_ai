@@ -288,7 +288,8 @@ def test_synthesizer_length_retry_uses_the_minimal_final_contract():
     ])
     provider = GroqProvider(api_key="test", client=fake, token_budget=TokenBudgetManager(7000))
     assert asyncio.run(provider.complete_json("normal synthesis prompt", {"news_summary": {"summary": "x" * 500}}, agent="research_synthesizer", max_output_tokens=1000)) == {"ok": True}
-    assert "one sentence, maximum 30 words" in fake.chat.completions.requests[1]["messages"][0]["content"]
+    assert "maximum 25 words" in fake.chat.completions.requests[1]["messages"][0]["content"]
+    assert "source_id and snippet are required" in fake.chat.completions.requests[1]["messages"][0]["content"]
     assert "normal synthesis prompt" not in fake.chat.completions.requests[1]["messages"][0]["content"]
 
 

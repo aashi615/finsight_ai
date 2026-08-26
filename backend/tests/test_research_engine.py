@@ -35,6 +35,19 @@ def test_complete_research_orchestration_succeeds_with_valid_market_analyst_json
     assert finished["report_id"]
 
 
+def test_repeated_job_polling_does_not_reexecute_agents_or_llm(client):
+    account = signup(client)
+    llm = FakeLLMProvider()
+    client.app.dependency_overrides[get_orchestrator] = lambda: make_orchestrator(llm)
+    headers = auth_headers(account["access_token"])
+    created = client.post("/api/v1/research", json={"ticker": "NVDA", "question": "Analyze the company's recent performance and major risks."}, headers=headers).json()["data"]
+    calls_after_job = len(llm.calls)
+    for _ in range(3):
+        response = client.get(f"/api/v1/research/{created['id']}", headers=headers)
+        assert response.status_code == 200
+    assert len(llm.calls) == calls_after_job
+
+
 def test_research_jobs_are_not_visible_across_tenants(client):
     first = signup(client, email="one@example.com", organization_name="One")
     second = signup(client, email="two@example.com", organization_name="Two")
@@ -124,6 +137,19 @@ def test_synthesis_rejects_risk_that_is_not_cited_in_top_level_evidence():
             key_risks=[{"claim": "unsupported", "evidence": [{"source_type": "NEWS", "source_id": "wrong", "snippet": "wrong"}]}],
             key_opportunities=[], evidence=[{"source_type": "NEWS", "source_id": "right", "snippet": "right"}],
             confidence=0.5, generated_at=datetime.now(timezone.utc),
+        )
+
+
+@pytest.mark.parametrize("evidence", [
+    [{"source_type": "NEWS", "snippet": "Required snippet"}],
+    [{"source_type": "NEWS", "source_id": "news_001"}],
+])
+def test_synthesis_schema_requires_source_id_and_snippet(evidence):
+    from app.schemas.research import ResearchSynthesis
+    with pytest.raises(ValueError):
+        ResearchSynthesis(
+            executive_summary="summary", company_overview="overview", market_analysis="market", news_analysis="news",
+            key_risks=[], key_opportunities=[], evidence=evidence, confidence=0.5, generated_at=datetime.now(timezone.utc),
         )
 
 
@@ -261,6 +287,29 @@ def test_synthesis_uses_valid_claim_evidence_when_legacy_branch_top_level_eviden
     legacy = validated.model_copy(update={"evidence": []})
     result = asyncio.run(ResearchSynthesizer(CapturingLLM()).synthesize(None, legacy, None))
     assert result.evidence[0].source_id == "news-1"
+
+
+def test_synthesis_accepts_manifest_source_id_and_restores_persisted_evidence():
+    class ManifestLLM:
+        async def complete_json(self, prompt, payload, **kwargs):
+            entry = payload["evidence_manifest"][0]
+            cited = {"source_type": entry["source_type"], "source_id": entry["evidence_id"], "snippet": entry["title"], "url": entry["source"]}
+            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market.", "news_analysis": "News.", "key_risks": [], "key_opportunities": [], "evidence": [cited], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
+
+    original = Evidence(source_type="NEWS", source_id="persisted-news-uuid", snippet="Canonical news", url="https://example.test/news")
+    result = asyncio.run(ResearchSynthesizer(ManifestLLM()).synthesize(None, NewsAnalysis(summary="news", themes=[], signals=[], evidence=[original]), None))
+    assert result.evidence[0].source_id == "persisted-news-uuid"
+
+
+def test_synthesis_rejects_invalid_manifest_source_id():
+    class InvalidManifestLLM:
+        async def complete_json(self, prompt, payload, **kwargs):
+            cited = {"source_type": "NEWS", "source_id": "news_999", "snippet": "Invented", "url": None}
+            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market.", "news_analysis": "News.", "key_risks": [], "key_opportunities": [], "evidence": [cited], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
+
+    source = Evidence(source_type="NEWS", source_id="persisted-news", snippet="Canonical")
+    with pytest.raises(AgentFailure, match="unsupported evidence"):
+        asyncio.run(ResearchSynthesizer(InvalidManifestLLM()).synthesize(None, NewsAnalysis(summary="news", themes=[], signals=[], evidence=[source]), None))
 
 
 def test_partial_agent_failure_preserves_successful_summary():

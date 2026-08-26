@@ -68,9 +68,15 @@ def _branch_evidence(analysis) -> list[Evidence]:
 
 def _canonical_synthesis_evidence(result: ResearchSynthesis, manifest: dict[str, Evidence]) -> ResearchSynthesis:
     """Validate model-selected manifest IDs and restore canonical evidence data."""
-    returned_ids = [item.evidence_id for item in result.evidence]
+    # The final-model contract uses source_id as the compact manifest reference
+    # so Pydantic still receives its required public fields. Older responses
+    # using the internal evidence_id remain accepted during rollout.
+    def manifest_id(item: Evidence) -> str | None:
+        return item.evidence_id or item.source_id
+
+    returned_ids = [manifest_id(item) for item in result.evidence]
     claim_items = [*result.key_risks, *result.key_opportunities]
-    claim_ids = [item.evidence_id for claim in claim_items for item in claim.evidence]
+    claim_ids = [manifest_id(item) for claim in claim_items for item in claim.evidence]
     unsupported = sorted({item for item in [*returned_ids, *claim_ids] if not item or item not in manifest})
     duplicates = sorted({item for item in returned_ids if item and returned_ids.count(item) > 1})
     missing_top_level = sorted({item for item in claim_ids if item and item not in returned_ids})
@@ -91,7 +97,7 @@ def _canonical_synthesis_evidence(result: ResearchSynthesis, manifest: dict[str,
         raise AgentFailure("Synthesizer returned unsupported evidence.", category="llm_invalid_response")
 
     def canonical(items: list[Evidence]) -> list[Evidence]:
-        return [manifest[item.evidence_id] for item in items]
+        return [manifest[manifest_id(item)] for item in items]
 
     risks = [claim.model_copy(update={"evidence": canonical(claim.evidence)}) for claim in result.key_risks]
     opportunities = [claim.model_copy(update={"evidence": canonical(claim.evidence)}) for claim in result.key_opportunities]

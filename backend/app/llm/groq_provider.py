@@ -357,7 +357,10 @@ class GroqProvider:
             # Do not intentionally send a near-zero-output request merely to
             # fit the current minute. Wait for a useful completion budget.
             delay = self._token_budget.delay_for(estimated_input + minimum_output)
-            poll_delay = min(delay, settings.groq_tpm_recheck_seconds)
+            # Sleep until the reservation window can actually change. Polling
+            # every six seconds only creates noisy delayed logs and cannot add
+            # TPM capacity before the oldest rolling reservation expires.
+            poll_delay = delay
             logger.warning("llm_request_delayed", extra={"provider": "groq", "agent": agent, "model": model, "estimated_input_tokens": estimated_input, "configured_max_output_tokens": configured_output, "requested_max_output_tokens": requested_output, "estimated_tokens": estimated_input + minimum_output, "available_tpm": available, "delay_seconds": round(poll_delay, 3), "reason": "tpm_budget", "retry_number": retry_number})
             self._sleep(poll_delay)
 
