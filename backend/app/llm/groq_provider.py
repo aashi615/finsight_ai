@@ -62,6 +62,13 @@ class TokenBudgetManager:
                 timestamp, _ = self._reservations[-1]
                 self._reservations[-1] = (timestamp, max(1, actual_tokens))
 
+    def release_latest(self, reserved_tokens: int) -> None:
+        """Release a reservation when Groq rejected a request without usage."""
+        with self._lock:
+            self._prune()
+            if self._reservations and self._reservations[-1][1] == reserved_tokens:
+                self._reservations.pop()
+
     def _prune(self) -> None:
         now = self._clock()
         while self._reservations and now - self._reservations[0][0] >= 60:
@@ -167,6 +174,7 @@ class GroqProvider:
                 choice = message = None
                 content = None
                 usage = None
+                estimated_total_tokens = None
                 try:
                     messages, estimated_input_tokens, input_compacted = self._messages(active_prompt, payload, input_limit, force_compact=force_compact_input)
                     estimated_total_tokens = estimated_input_tokens + max_output_tokens
@@ -202,6 +210,10 @@ class GroqProvider:
                                 fallback_used = True
                                 self._verify_model_available(active_model)
                             continue
+                        if self._activate_fallback(agent, model, active_model, fallback_used, "completion_limit"):
+                            active_model, fallback_used = settings.groq_reasoning_fallback_model, True
+                            self._verify_model_available(active_model)
+                            continue
                         category = "llm_reasoning_budget_exhausted" if empty_visible_content else "llm_incomplete_response"
                         raise LLMProviderError("Groq exhausted the completion budget before returning visible JSON." if empty_visible_content else "Groq response was incomplete because it reached the output token limit.", category=category)
                     parsed = self._parse_json_response(content, agent, request_id, response_details, active_model)
@@ -225,6 +237,11 @@ class GroqProvider:
                 except LLMProviderError:
                     raise
                 except Exception as exc:
+                    # No completion object means there is no actual usage to
+                    # reconcile. Remove this attempt's pessimistic reservation
+                    # before the retry/fallback re-enters the same scheduler.
+                    if estimated_total_tokens is not None:
+                        self._token_budget.release_latest(estimated_total_tokens)
                     category, retryable, retry_after = self._classify_error(exc)
                     self._log_error(agent, active_model, transport_attempt + 1, category, exc)
                     if not retryable or transport_attempt >= settings.max_llm_retries or fallback_used:
@@ -236,7 +253,7 @@ class GroqProvider:
                             continue
                         message = "Groq quota is exhausted." if category == "llm_quota_exhausted" else "Groq rejected the requested JSON output." if category == "llm_invalid_response" else "Groq provider is temporarily unavailable."
                         raise LLMProviderError(message, category=category) from exc
-                    delay = self._retry_delay(transport_attempt, retry_after)
+                    delay = self._retry_delay(transport_attempt, retry_after) + settings.groq_retry_safety_seconds
                     logger.warning("llm_retry", extra={"provider": "groq", "agent": agent, "model": active_model, "attempt": transport_attempt + 1, "retry_delay_seconds": round(delay, 3), "error_category": category})
                     self._sleep(delay)
                     transport_attempt += 1

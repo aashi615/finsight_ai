@@ -54,12 +54,17 @@ def test_groq_incomplete_response_retries_once_with_a_compact_request():
 
 
 def test_groq_incomplete_response_twice_fails_without_infinite_retries():
-    fake = client([completion({"partial": True}, finish_reason="length", output_tokens=2000), completion({"still": "partial"}, finish_reason="length", output_tokens=2000)])
+    fake = client([
+        completion({"partial": True}, finish_reason="length", output_tokens=2000),
+        completion({"still": "partial"}, finish_reason="length", output_tokens=2000),
+        completion({"qwen": "partial"}, finish_reason="length", output_tokens=2000),
+    ])
     provider = GroqProvider(api_key="test", client=fake)
     with pytest.raises(LLMProviderError, match="incomplete") as error:
         asyncio.run(provider.complete_json("prompt", {}, agent="news_analyst", max_output_tokens=2000))
     assert error.value.category == "llm_incomplete_response"
-    assert fake.chat.completions.calls == 2
+    assert fake.chat.completions.calls == 3
+    assert fake.chat.completions.requests[-1]["model"] == "qwen/qwen3.6-27b"
 
 
 def test_groq_market_request_uses_supported_low_reasoning_configuration():
@@ -143,10 +148,10 @@ def test_groq_response_preview_is_reserved_for_failure_diagnostics():
 
 def test_groq_json_validation_failure_is_categorized_as_invalid_response():
     rejected = ProviderException(400, {"error": {"type": "invalid_request_error", "code": "json_validate_failed", "message": "Failed to validate JSON"}})
-    provider = GroqProvider(api_key="test", client=client([rejected]))
-    with pytest.raises(LLMProviderError, match="rejected the requested JSON output") as error:
-        asyncio.run(provider.complete_json("prompt", {}, agent="market_analyst", max_output_tokens=900))
-    assert error.value.category == "llm_invalid_response"
+    fake = client([rejected, completion()])
+    provider = GroqProvider(api_key="test", client=fake)
+    assert asyncio.run(provider.complete_json("prompt", {}, agent="market_analyst", max_output_tokens=900)) == {"ok": True}
+    assert [request["model"] for request in fake.chat.completions.requests] == ["openai/gpt-oss-20b", "qwen/qwen3.6-27b"]
 
 
 def test_groq_rate_limit_retries_but_quota_does_not():
@@ -155,7 +160,7 @@ def test_groq_rate_limit_retries_but_quota_does_not():
     delays = []
     provider = GroqProvider(api_key="test", client=fake, sleep=delays.append, random_value=lambda: 0)
     assert asyncio.run(provider.complete_json("system", {}, agent="news_analyst", max_output_tokens=900)) == {"ok": True}
-    assert fake.chat.completions.calls == 2 and delays == [1]
+    assert fake.chat.completions.calls == 2 and delays == [7]
 
     quota = ProviderException(429, {"error": {"code": "insufficient_quota", "message": "quota exhausted"}})
     fake = client([quota])
@@ -199,7 +204,7 @@ def test_token_429_respects_retry_after_and_max_retry_count():
     delays = []
     provider = GroqProvider(api_key="test", client=fake, sleep=delays.append, random_value=lambda: 0, token_budget=TokenBudgetManager(7000))
     assert asyncio.run(provider.complete_json("prompt", {}, agent="news_analyst", max_output_tokens=700)) == {"ok": True}
-    assert delays == [3] and fake.chat.completions.calls == 2
+    assert delays == [9] and fake.chat.completions.calls == 2
 
 
 def test_empty_gpt_oss_length_response_uses_non_thinking_fallback_not_same_request():
@@ -214,3 +219,39 @@ def test_empty_gpt_oss_length_response_uses_non_thinking_fallback_not_same_reque
     assert second["model"] == "qwen/qwen3.6-27b"
     assert second["reasoning_effort"] == "none"
     assert first["messages"] != second["messages"]
+
+
+def test_visible_length_after_compact_retry_falls_back_to_qwen_once():
+    fake = client([
+        completion({"partial": True}, finish_reason="length", output_tokens=900),
+        completion({"partial": True}, finish_reason="length", output_tokens=900),
+        completion({"ok": True}),
+    ])
+    provider = GroqProvider(api_key="test", client=fake, token_budget=TokenBudgetManager(7000))
+    assert asyncio.run(provider.complete_json("prompt", {}, agent="market_analyst", max_output_tokens=900)) == {"ok": True}
+    assert [request["model"] for request in fake.chat.completions.requests] == [
+        "openai/gpt-oss-20b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b",
+    ]
+
+
+def test_primary_models_route_research_agents_to_gpt_oss_and_synthesizer_to_qwen():
+    fake = client([completion(), completion(), completion(), completion()])
+    provider = GroqProvider(api_key="test", client=fake, token_budget=TokenBudgetManager(7000))
+    for agent in ("news_analyst", "market_analyst", "document_rag_agent", "research_synthesizer"):
+        asyncio.run(provider.complete_json("prompt", {}, agent=agent, max_output_tokens=5000))
+    assert [request["model"] for request in fake.chat.completions.requests] == [
+        "openai/gpt-oss-20b", "openai/gpt-oss-20b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b",
+    ]
+
+
+def test_qwen_fallback_is_attempted_once_and_reuses_tpm_scheduler():
+    primary_failure = ProviderException(500, {"error": {"message": "server unavailable"}})
+    qwen_failure = ProviderException(500, {"error": {"message": "server unavailable"}})
+    fake = client([primary_failure, primary_failure, primary_failure, qwen_failure])
+    budget = TokenBudgetManager(7000)
+    provider = GroqProvider(api_key="test", client=fake, sleep=lambda _: None, random_value=lambda: 0, token_budget=budget)
+    with pytest.raises(LLMProviderError):
+        asyncio.run(provider.complete_json("prompt", {}, agent="news_analyst", max_output_tokens=800))
+    assert [request["model"] for request in fake.chat.completions.requests].count("qwen/qwen3.6-27b") == 1
+    assert fake.chat.completions.requests[-1]["model"] == "qwen/qwen3.6-27b"
+    assert budget.available() == 7000

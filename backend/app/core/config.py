@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     groq_tpm_limit: int = 8000
     groq_safe_tpm_limit: int = 7000
     max_llm_retries: int = 2
+    groq_retry_safety_seconds: float = 6.0
     research_agent_input_token_limit: int = 1800
     final_agent_input_token_limit: int = 1800
     news_article_limit: int = 6
