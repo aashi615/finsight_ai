@@ -6,6 +6,10 @@ from app.models.research_job import ResearchJobStatus
 
 
 class Evidence(BaseModel):
+    # Internal, stable reference used only between agents.  It is excluded from
+    # serialized API/report output so the existing public Evidence shape stays
+    # unchanged.
+    evidence_id: str | None = Field(default=None, exclude=True)
     source_type: str
     source_id: str
     snippet: str = Field(min_length=1, max_length=1000)

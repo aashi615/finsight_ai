@@ -5,7 +5,7 @@ import httpx
 import pytest
 from app.core.database import get_db
 from app.api.v1.companies import get_research_service
-from app.providers.base import CompanyData, MarketBarData, NewsArticleData, ProviderError
+from app.providers.base import CompanyData, MarketBarData, NewsArticleData, ProviderError, UnknownTickerError
 from app.providers.finnhub import FinnhubProvider
 from app.providers.fallback_market import FallbackMarketDataProvider
 from app.providers.yahoo_finance import YahooFinanceProvider
@@ -60,6 +60,50 @@ def test_company_ticker_is_normalized_and_persisted_once(client):
     assert first.ticker == "NVDA"
     assert second.id == first.id
     assert market.company_calls == 1
+
+
+def test_company_name_and_ticker_resolution_use_provider_canonical_symbol(client):
+    class NameResolvingMarket(FakeMarketProvider):
+        def get_company(self, query):
+            self.company_calls += 1
+            mapping = {"NVIDIA": "NVDA", "NVDA": "NVDA", "MICROSOFT": "MSFT", "MSFT": "MSFT"}
+            canonical = mapping.get(query.strip().upper())
+            if not canonical:
+                raise UnknownTickerError("not found")
+            return CompanyData(ticker=canonical, name="Microsoft Corporation" if canonical == "MSFT" else "NVIDIA Corporation")
+
+    db = next(client.app.dependency_overrides[get_db]())
+    provider = NameResolvingMarket()
+    service = ResearchService(provider, FakeNewsProvider())
+    assert service.resolve_company(db, "NVIDIA").ticker == "NVDA"
+    assert service.resolve_company(db, "nvda").ticker == "NVDA"
+    assert service.resolve_company(db, "Microsoft").ticker == "MSFT"
+    assert service.resolve_company(db, "microsoft").ticker == "MSFT"
+    assert service.resolve_company(db, "MSFT").ticker == "MSFT"
+
+
+def test_unknown_company_is_resolution_error_not_database_error(client):
+    class UnknownCompanyMarket(FakeMarketProvider):
+        def get_company(self, query):
+            raise UnknownTickerError("not found")
+
+    db = next(client.app.dependency_overrides[get_db]())
+    with pytest.raises(HTTPException) as failure:
+        ResearchService(UnknownCompanyMarket(), FakeNewsProvider()).resolve_company(db, "not-a-company")
+    assert failure.value.status_code == 404
+    assert failure.value.detail["code"] == "UNKNOWN_TICKER"
+
+
+def test_company_resolution_provider_failure_is_not_database_error(client):
+    class UnavailableMarket(FakeMarketProvider):
+        def get_company(self, query):
+            raise ProviderError("provider unavailable")
+
+    db = next(client.app.dependency_overrides[get_db]())
+    with pytest.raises(HTTPException) as failure:
+        ResearchService(UnavailableMarket(), FakeNewsProvider()).resolve_company(db, "Microsoft")
+    assert failure.value.status_code == 503
+    assert failure.value.detail["code"] == "PROVIDER_UNAVAILABLE"
 
 
 def test_market_data_is_normalized_persisted_and_cached(client):

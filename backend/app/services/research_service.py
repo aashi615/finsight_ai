@@ -3,6 +3,8 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from urllib.parse import urlsplit, urlunsplit
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+import logging
 from app.core.exceptions import api_error
 from app.models.company import Company
 from app.models.market_data import MarketData
@@ -13,6 +15,8 @@ from app.repositories.company_repository import CompanyRepository
 from app.repositories.market_data_repository import MarketDataRepository
 from app.repositories.news_repository import NewsRepository
 from app.repositories.research_source_repository import ResearchSourceRepository
+
+logger = logging.getLogger(__name__)
 
 
 def canonical_url(url: str) -> str:
@@ -33,23 +37,44 @@ class ResearchService:
         self.sources = ResearchSourceRepository()
 
     def resolve_company(self, db: Session, ticker: str) -> Company:
-        normalized_ticker = ticker.strip().upper()
+        company_input = ticker.strip()
+        normalized_ticker = company_input.upper()
+        logger.info("company_resolution_started", extra={"company": company_input, "normalized_company_input": normalized_ticker})
         company = self.companies.get_by_ticker(db, normalized_ticker)
         if company:
+            logger.info("company_resolution_cache_hit", extra={"company": company.ticker, "company_input": company_input})
             return company
         try:
-            data = self.market_provider.get_company(normalized_ticker)
+            # Preserve a company-name query for the source-backed resolver while
+            # still accepting ticker symbols case-insensitively.
+            data = self.market_provider.get_company(company_input)
         except UnknownTickerError:
             raise api_error(404, "UNKNOWN_TICKER", "Company ticker was not found.")
-        except ProviderError:
+        except ProviderError as exc:
+            logger.warning("company_resolution_provider_failed", extra={"company": company_input, "provider_status_code": exc.status_code, "error_category": "ticker_resolution"})
             raise api_error(503, "PROVIDER_UNAVAILABLE", "Company data provider is unavailable.")
         canonical_ticker = data.ticker.strip().upper()
         if not data.name or not canonical_ticker:
             raise api_error(502, "MALFORMED_PROVIDER_RESPONSE", "Company data provider returned invalid data.")
+        # A source-backed name resolution can return an already-persisted
+        # canonical ticker (e.g. Microsoft -> MSFT).
+        company = self.companies.get_by_ticker(db, canonical_ticker)
+        if company:
+            logger.info("company_resolution_canonical_cache_hit", extra={"company": company.ticker, "company_input": company_input})
+            return company
         company = Company(ticker=canonical_ticker, name=data.name.strip(), exchange=data.exchange, country=data.country, sector=data.sector, industry=data.industry)
         self.companies.create(db, company)
-        db.commit()
-        db.refresh(company)
+        try:
+            db.commit()
+            db.refresh(company)
+        except IntegrityError:
+            # Concurrent requests may resolve the same canonical symbol. This
+            # is not a database outage; reuse the row created by the winner.
+            db.rollback()
+            company = self.companies.get_by_ticker(db, canonical_ticker)
+            if company is None:
+                raise
+        logger.info("company_resolution_succeeded", extra={"company": company.ticker, "company_input": company_input, "canonical_ticker": canonical_ticker})
         return company
 
     def get_market_data(self, db: Session, ticker: str, from_date: date, to_date: date) -> tuple[Company, list[MarketData]]:

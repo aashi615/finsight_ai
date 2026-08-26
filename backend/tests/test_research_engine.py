@@ -169,16 +169,60 @@ def test_final_synthesis_receives_only_independent_compact_summaries():
         payload = None
         async def complete_json(self, prompt, payload, **kwargs):
             self.payload = payload
-            evidence = [item for summary in payload.values() if summary for item in summary["evidence"]]
+            source_evidence = next(summary["evidence"] for key, summary in payload.items() if key.endswith("_summary") and summary and summary["evidence"])
+            manifest_id = payload["evidence_manifest"][0]["evidence_id"]
+            evidence = [{"evidence_id": manifest_id, **source_evidence[0]}]
             return {"executive_summary": "Based on available data.", "company_overview": "Available data.", "market_analysis": "Available data.", "news_analysis": "Available data.", "key_risks": [], "key_opportunities": [], "evidence": evidence, "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
 
     evidence = Evidence(source_type="NEWS", source_id="n1", snippet="compact", url="https://example.test")
     llm = CapturingLLM()
     result = asyncio.run(ResearchSynthesizer(llm).synthesize(None, NewsAnalysis(summary="news", themes=[], signals=[], evidence=[evidence]), DocumentAnalysis(summary="rag", findings=[], evidence=[])))
     assert result.confidence == 0.5
-    assert set(llm.payload) == {"news_summary", "market_summary", "rag_summary"}
+    assert set(llm.payload) == {"news_summary", "market_summary", "rag_summary", "evidence_manifest"}
     assert llm.payload["market_summary"] is None
     assert "articles" not in str(llm.payload) and "chunks" not in str(llm.payload)
+
+
+@pytest.mark.parametrize("source_type, prefix", [("NEWS", "news"), ("DOCUMENT", "rag")])
+def test_synthesis_accepts_manifest_backed_evidence_and_restores_canonical_value(source_type, prefix):
+    class ManifestLLM:
+        async def complete_json(self, prompt, payload, **kwargs):
+            entry = next(item for item in payload["evidence_manifest"] if item["evidence_id"].startswith(prefix))
+            source = next(summary for key, summary in payload.items() if key.endswith("_summary") and summary and summary["evidence"])
+            copied = {"evidence_id": entry["evidence_id"], **source["evidence"][0]}
+            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market.", "news_analysis": "News.", "key_risks": [{"claim": "Risk.", "evidence": [copied]}], "key_opportunities": [], "evidence": [copied], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
+
+    evidence = Evidence(source_type=source_type, source_id="source-1", snippet="Canonical title", url="https://example.test/source")
+    news = NewsAnalysis(summary="news", themes=[], signals=[], evidence=[evidence]) if source_type == "NEWS" else None
+    rag = DocumentAnalysis(summary="rag", findings=[], evidence=[evidence]) if source_type == "DOCUMENT" else None
+    result = asyncio.run(ResearchSynthesizer(ManifestLLM()).synthesize(None, news, rag))
+    assert result.evidence[0].model_dump() == evidence.model_dump()
+    assert result.key_risks[0].evidence[0].model_dump() == evidence.model_dump()
+
+
+@pytest.mark.parametrize("bad_reference", ["news_999", "Canonical title", "https://example.test/source", "news_001_changed"])
+def test_synthesis_rejects_fabricated_title_url_or_modified_manifest_reference(bad_reference):
+    class InvalidEvidenceLLM:
+        async def complete_json(self, prompt, payload, **kwargs):
+            copied = {"evidence_id": bad_reference, "source_type": "NEWS", "source_id": "source-1", "snippet": "Canonical title", "url": "https://example.test/source"}
+            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market.", "news_analysis": "News.", "key_risks": [], "key_opportunities": [], "evidence": [copied], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
+
+    news = NewsAnalysis(summary="news", themes=[], signals=[], evidence=[Evidence(source_type="NEWS", source_id="source-1", snippet="Canonical title", url="https://example.test/source")])
+    with pytest.raises(AgentFailure, match="unsupported evidence"):
+        asyncio.run(ResearchSynthesizer(InvalidEvidenceLLM()).synthesize(None, news, None))
+
+
+def test_synthesis_rejects_duplicate_or_unavailable_evidence_reference():
+    class InvalidEvidenceLLM:
+        async def complete_json(self, prompt, payload, **kwargs):
+            original = next(summary["evidence"][0] for key, summary in payload.items() if key.endswith("_summary") and summary)
+            copied = {"evidence_id": "news_001", **original}
+            unavailable = {"evidence_id": "rag_001", **original}
+            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market.", "news_analysis": "News.", "key_risks": [{"claim": "Risk.", "evidence": [unavailable]}], "key_opportunities": [], "evidence": [copied, copied], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
+
+    news = NewsAnalysis(summary="news", themes=[], signals=[], evidence=[Evidence(source_type="NEWS", source_id="source-1", snippet="Canonical title")])
+    with pytest.raises(AgentFailure, match="unsupported evidence"):
+        asyncio.run(ResearchSynthesizer(InvalidEvidenceLLM()).synthesize(None, news, None))
 
 
 def test_partial_agent_failure_preserves_successful_summary():

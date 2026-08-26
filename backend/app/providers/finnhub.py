@@ -26,12 +26,15 @@ class FinnhubProvider:
             raise ProviderError("Provider is unavailable or returned malformed data.") from exc
 
     def get_company(self, ticker: str) -> CompanyData:
-        data = self._get("/stock/profile2", {"symbol": ticker})
+        query = ticker.strip()
+        # Profile is fast for canonical symbols; company-name resolution below
+        # uses Finnhub's searchable company catalogue rather than local cases.
+        data = self._get("/stock/profile2", {"symbol": query.upper()})
         if not isinstance(data, dict) or not data.get("name"):
-            data = self._find_company_by_name(ticker)
+            data = self._find_company_by_name(query)
         if not isinstance(data, dict) or not data.get("name"):
             raise UnknownTickerError("Ticker or company name was not found.")
-        return CompanyData(ticker=str(data.get("ticker") or ticker), name=str(data["name"]), exchange=data.get("exchange"), country=data.get("country"), industry=data.get("finnhubIndustry"))
+        return CompanyData(ticker=str(data.get("ticker") or query.upper()), name=str(data["name"]), exchange=data.get("exchange"), country=data.get("country"), industry=data.get("finnhubIndustry"))
 
     def _find_company_by_name(self, query: str) -> dict | None:
         """Resolve a company name to its exchange ticker without exposing search payloads."""
@@ -42,7 +45,13 @@ class FinnhubProvider:
         if not candidates:
             return None
         normalized_query = query.strip().casefold()
-        best = next((item for item in candidates if str(item["description"]).casefold() == normalized_query), candidates[0])
+        # Prefer an exact source-catalogue company match, then a description
+        # that starts with the name ("Microsoft" -> "Microsoft Corp"), then
+        # retain Finnhub's ordered best result.
+        best = next(
+            (item for item in candidates if str(item["description"]).casefold() == normalized_query),
+            next((item for item in candidates if str(item["description"]).casefold().startswith(normalized_query)), candidates[0]),
+        )
         profile = self._get("/stock/profile2", {"symbol": str(best["symbol"])})
         if not isinstance(profile, dict) or not profile.get("name"):
             return None

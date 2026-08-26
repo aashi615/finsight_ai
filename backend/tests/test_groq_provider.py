@@ -6,6 +6,7 @@ import pytest
 
 from app.llm.base import LLMProviderError
 from app.llm.groq_provider import GroqProvider, TokenBudgetManager, extract_json_object, normalize_json_response
+from app.core.config import settings
 
 
 def completion(payload=None, *, finish_reason="stop", output_tokens=7, content=None, reasoning=None):
