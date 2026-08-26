@@ -185,7 +185,7 @@ def test_groq_enforces_agent_output_budgets():
         ("news_analyst", 4096, 800),
         ("market_analyst", 4913, 900),
         ("document_rag_agent", 2000, 800),
-        ("research_synthesizer", 5000, 1500),
+        ("research_synthesizer", 9000, 5200),
     ]:
         asyncio.run(provider.complete_json("prompt", {}, agent=agent, max_output_tokens=requested))
         assert fake.chat.completions.requests[-1]["max_completion_tokens"] == expected
