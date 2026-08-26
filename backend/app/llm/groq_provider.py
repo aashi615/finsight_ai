@@ -331,20 +331,34 @@ class GroqProvider:
             logger.warning("llm_output_budget_clamped", extra={"provider": "groq", "agent": agent, "requested_max_output_tokens": requested, "enforced_max_output_tokens": enforced})
         return enforced
 
+    @staticmethod
+    def _minimum_output_budget(agent: str) -> int:
+        """Minimum completion capacity needed for a useful compact response."""
+        return {
+            "news_analyst": 300,
+            "market_analyst": 300,
+            "document_rag_agent": 300,
+            "research_synthesizer": 1200,
+        }[agent]
+
     def _reserve_available_tpm(self, agent: str, model: str, estimated_input: int, configured_output: int, retry_number: int) -> tuple[int, int]:
         if estimated_input >= settings.groq_safe_tpm_limit:
             raise LLMProviderError("LLM input alone exceeds the safe TPM budget before it can be sent.", category="llm_provider_error")
+        minimum_output = min(configured_output, self._minimum_output_budget(agent))
         while True:
             available = self._token_budget.available()
-            requested_output = min(configured_output, max(0, available - estimated_input))
-            if requested_output:
+            available_output = max(0, available - estimated_input)
+            requested_output = min(configured_output, available_output)
+            if requested_output >= minimum_output:
                 estimated_total = estimated_input + requested_output
                 if self._token_budget.reserve_or_delay(estimated_total) == 0:
                     return requested_output, estimated_total
                 continue
-            delay = self._token_budget.delay_for(estimated_input + 1)
+            # Do not intentionally send a near-zero-output request merely to
+            # fit the current minute. Wait for a useful completion budget.
+            delay = self._token_budget.delay_for(estimated_input + minimum_output)
             poll_delay = min(delay, settings.groq_tpm_recheck_seconds)
-            logger.warning("llm_request_delayed", extra={"provider": "groq", "agent": agent, "model": model, "estimated_input_tokens": estimated_input, "configured_max_output_tokens": configured_output, "requested_max_output_tokens": 0, "estimated_tokens": estimated_input, "available_tpm": available, "delay_seconds": round(poll_delay, 3), "reason": "tpm_budget", "retry_number": retry_number})
+            logger.warning("llm_request_delayed", extra={"provider": "groq", "agent": agent, "model": model, "estimated_input_tokens": estimated_input, "configured_max_output_tokens": configured_output, "requested_max_output_tokens": requested_output, "estimated_tokens": estimated_input + minimum_output, "available_tpm": available, "delay_seconds": round(poll_delay, 3), "reason": "tpm_budget", "retry_number": retry_number})
             self._sleep(poll_delay)
 
     @staticmethod

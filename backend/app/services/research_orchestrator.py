@@ -86,8 +86,22 @@ class ResearchOrchestrator:
         # Fetch sync providers off the event loop; yfinance is blocking.
         to_date = datetime.now(timezone.utc).date()
         from_date = to_date - timedelta(days=30)
-        _, market_rows = await self.research_service.get_market_data_async(db, company.ticker, from_date, to_date)
-        _, news_rows = self.research_service.get_news(db, company.ticker, from_date, to_date, limit=10)
+        # Data providers are independent sources. A Finnhub/Yahoo outage must
+        # not discard usable news or tenant-document evidence for this job.
+        try:
+            _, market_rows = await self.research_service.get_market_data_async(db, company.ticker, from_date, to_date)
+        except HTTPException as exc:
+            if not self._is_market_data_failure(exc):
+                raise
+            market_rows = []
+            logger.warning("research_source_unavailable", extra={"job_id": str(job.id), "company": company.ticker, "agent": "market_analyst", "error_category": "market_data_provider"})
+        try:
+            _, news_rows = self.research_service.get_news(db, company.ticker, from_date, to_date, limit=10)
+        except HTTPException as exc:
+            if not self._is_market_data_failure(exc):
+                raise
+            news_rows = []
+            logger.warning("research_source_unavailable", extra={"job_id": str(job.id), "company": company.ticker, "agent": "news_analyst", "error_category": "news_provider"})
         context = {"company": company, "market": market_rows, "news": news_rows, "question": job.question}
         chunks = self.rag_service.retrieve(db, job.organization_id, job.question, company.id, limit=3)
         # Logical branches are independent. They are deliberately scheduled one

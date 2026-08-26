@@ -4,6 +4,8 @@ from decimal import Decimal
 from urllib.parse import urlsplit, urlunsplit
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 import logging
 from app.core.exceptions import api_error
 from app.models.company import Company
@@ -144,17 +146,37 @@ class ResearchService:
             normalized = [(article, canonical_url(article.url)) for article in articles]
         except ValueError:
             raise api_error(502, "MALFORMED_PROVIDER_RESPONSE", "News provider returned an invalid article URL.")
-        urls = list(dict.fromkeys(url for _, url in normalized))
-        existing_articles = self.news.existing_urls(db, urls)
-        existing_sources = self.sources.existing_urls(db, company.id, urls)
+        # URL normalization removes duplicates in one provider response. The
+        # database conflict clause handles a second worker inserting the same
+        # URL between this request and commit.
+        unique_articles = {url: article for article, url in normalized}
         for article, url in normalized:
-            if url not in existing_articles:
-                db.add(NewsArticle(company_id=company.id, title=article.title.strip(), summary=article.summary, url=url, published_at=article.published_at, source_name=article.source_name, author=article.author))
-                existing_articles.add(url)
-            if url not in existing_sources:
-                db.add(ResearchSource(company_id=company.id, source_type=SourceType.NEWS, source_name=article.source_name, source_url=url, title=article.title.strip(), published_at=article.published_at, metadata_json={"author": article.author} if article.author else None))
-                existing_sources.add(url)
+            if unique_articles.get(url) is not article:
+                continue
+            self._insert_ignore_conflict(
+                db, NewsArticle,
+                {"company_id": company.id, "title": article.title.strip(), "summary": article.summary, "url": url, "published_at": article.published_at, "source_name": article.source_name, "author": article.author},
+                [NewsArticle.url],
+            )
+            self._insert_ignore_conflict(
+                db, ResearchSource,
+                {"company_id": company.id, "source_type": SourceType.NEWS, "source_name": article.source_name, "source_url": url, "title": article.title.strip(), "published_at": article.published_at, "metadata_json": {"author": article.author} if article.author else None},
+                [ResearchSource.company_id, ResearchSource.source_url],
+            )
         db.commit()
+
+    @staticmethod
+    def _insert_ignore_conflict(db: Session, model, values: dict, index_elements: list) -> None:
+        """Use database-enforced idempotency; pre-read checks are race-prone."""
+        dialect = db.get_bind().dialect.name
+        if dialect == "postgresql":
+            db.execute(postgres_insert(model).values(**values).on_conflict_do_nothing(index_elements=index_elements))
+        elif dialect == "sqlite":
+            db.execute(sqlite_insert(model).values(**values).on_conflict_do_nothing(index_elements=index_elements))
+        else:
+            # Production is PostgreSQL. Keep local non-SQLite development
+            # environments functional while still relying on their constraint.
+            db.add(model(**values))
 
     @staticmethod
     def _validate_range(from_date: date, to_date: date) -> None:

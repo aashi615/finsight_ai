@@ -1,16 +1,22 @@
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import math
+import time as stdlib_time
 
 import yfinance as yf
 
 from app.providers.base import MarketBarData, ProviderError
+from app.core.config import settings
 
 
 class YahooFinanceProvider:
     """Adapter that normalizes Yahoo daily OHLCV history into MarketBarData."""
 
     source_name = "yahoo_finance"
+
+    def __init__(self, *, retries: int | None = None, sleep=stdlib_time.sleep):
+        self._retries = settings.yahoo_max_retries if retries is None else retries
+        self._sleep = sleep
 
     def get_market_data(self, ticker: str, from_date: date, to_date: date) -> list[MarketBarData]:
         if from_date > to_date:
@@ -19,17 +25,29 @@ class YahooFinanceProvider:
         effective_end = min(to_date, date.today())
         if from_date > effective_end:
             raise ProviderError("Yahoo Finance historical date range is in the future.")
-        try:
-            history = yf.Ticker(ticker).history(
-                start=from_date,
-                end=effective_end + timedelta(days=1),
-                interval="1d",
-                auto_adjust=False,
-            )
-        except Exception as exc:
-            raise ProviderError("Yahoo Finance historical market data is unavailable.") from exc
+        history = None
+        last_error = None
+        for attempt in range(self._retries + 1):
+            try:
+                history = yf.Ticker(ticker).history(
+                    start=from_date,
+                    end=effective_end + timedelta(days=1),
+                    interval="1d",
+                    auto_adjust=False,
+                )
+                # yfinance commonly represents a transient throttle/network
+                # response as an empty dataframe instead of raising.
+                if history is not None and not history.empty:
+                    break
+                last_error = ProviderError("Yahoo Finance returned no historical market data.")
+            except Exception as exc:
+                last_error = exc
+            if attempt < self._retries:
+                self._sleep(settings.yahoo_retry_seconds * (2**attempt))
+        if history is None and last_error is not None:
+            raise ProviderError("Yahoo Finance historical market data is unavailable.") from last_error
         if history is None or history.empty:
-            raise ProviderError("Yahoo Finance returned no historical market data.")
+            raise ProviderError("Yahoo Finance returned no historical market data.") from last_error
 
         bars: list[MarketBarData] = []
         try:

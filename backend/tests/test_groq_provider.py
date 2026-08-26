@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -186,7 +187,7 @@ def test_groq_enforces_agent_output_budgets():
         ("news_analyst", 4096, 800),
         ("market_analyst", 4913, 900),
         ("document_rag_agent", 2000, 800),
-        ("research_synthesizer", 9000, 5200),
+        ("research_synthesizer", 9000, 1600),
     ]:
         asyncio.run(provider.complete_json("prompt", {}, agent=agent, max_output_tokens=requested))
         assert fake.chat.completions.requests[-1]["max_completion_tokens"] == expected
@@ -198,15 +199,49 @@ def test_tpm_guard_delays_when_request_would_exceed_safe_limit():
     assert budget.reserve_or_delay(1200) > 0
 
 
+def test_concurrent_agents_share_one_tpm_budget_without_over_reserving():
+    budget = TokenBudgetManager(7000)
+    barrier = threading.Barrier(3)
+    results = []
+    def reserve():
+        barrier.wait()
+        results.append(budget.reserve_or_delay(4000))
+    workers = [threading.Thread(target=reserve) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    barrier.wait()
+    for worker in workers:
+        worker.join()
+    assert results.count(0.0) == 1
+    assert sum(delay > 0 for delay in results) == 1
+    assert budget.available() == 3000
+
+
+def test_low_remaining_tpm_waits_until_minimum_viable_output_budget_before_send():
+    now = [0.0]
+    budget = TokenBudgetManager(7000, clock=lambda: now[0])
+    assert budget.reserve_or_delay(6900) == 0
+    fake = client([completion()])
+    waits = []
+    def advance(seconds):
+        waits.append(seconds)
+        now[0] += seconds
+    provider = GroqProvider(api_key="test", client=fake, sleep=advance, token_budget=budget)
+    assert asyncio.run(provider.complete_json("prompt", {}, agent="news_analyst", max_output_tokens=800)) == {"ok": True}
+    assert waits and sum(waits) >= 60
+    assert fake.chat.completions.requests[0]["max_completion_tokens"] >= 300
+
+
 def test_request_uses_current_available_output_budget_instead_of_waiting_for_configured_cap():
     budget = TokenBudgetManager(7000)
-    assert budget.reserve_or_delay(3500) == 0
+    # Leave a useful but smaller-than-configured final completion budget.
+    assert budget.reserve_or_delay(5700) == 0
     fake = client([completion()])
     provider = GroqProvider(api_key="test", client=fake, token_budget=budget)
-    asyncio.run(provider.complete_json("prompt", {}, agent="research_synthesizer", max_output_tokens=5200))
+    asyncio.run(provider.complete_json("prompt", {}, agent="research_synthesizer", max_output_tokens=1600))
     request = fake.chat.completions.requests[0]
     input_tokens = provider._messages("prompt", {}, settings.final_agent_input_token_limit)[1]
-    assert request["max_completion_tokens"] == 3500 - input_tokens
+    assert request["max_completion_tokens"] == 1300 - input_tokens
 
 
 def test_token_429_respects_retry_after_and_max_retry_count():

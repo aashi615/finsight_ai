@@ -19,3 +19,6 @@ def configure_logging() -> None:
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(logging.INFO)
+    # httpx logs fully rendered request URLs. Provider API keys are query
+    # parameters for some market APIs, so never emit those URLs in production.
+    logging.getLogger("httpx").setLevel(logging.WARNING)

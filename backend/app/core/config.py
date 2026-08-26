@@ -30,10 +30,9 @@ class Settings(BaseSettings):
     news_max_output_tokens: int = 800
     market_max_output_tokens: int = 900
     rag_max_output_tokens: int = 800
-    # Qwen supports a larger provider maximum, but 5,200 is the largest
-    # completion reservation compatible with the 1,800-token final input cap
-    # and this application's 7,000 TPM safety ceiling.
-    final_max_output_tokens: int = 5200
+    # The final result is deliberately compact.  Keeping it below 1,600 avoids
+    # consuming the entire organization-wide 8k TPM allowance in one request.
+    final_max_output_tokens: int = 1600
     groq_tpm_limit: int = 8000
     groq_safe_tpm_limit: int = 7000
     max_llm_retries: int = 2
@@ -46,6 +45,8 @@ class Settings(BaseSettings):
     market_history_points_limit: int = 12
     rag_top_k: int = 3
     rag_chunk_chars: int = 600
+    yahoo_max_retries: int = 1
+    yahoo_retry_seconds: float = 1.0
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
     frontend_url: str | None = "http://localhost:5173"
     max_request_body_bytes: int = 1_000_000

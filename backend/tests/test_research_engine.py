@@ -77,7 +77,7 @@ def test_provider_failure_is_controlled_and_job_fails(client):
     assert client.get(f"/api/v1/research/{job_id}", headers=auth_headers(account["access_token"])).json()["data"]["status"] == "FAILED"
 
 
-def test_both_historical_market_providers_failing_marks_job_with_clear_error(client):
+def test_market_provider_failure_preserves_other_evidence_and_completes_partial_research(client):
     class MarketUnavailableProvider(FakeResearchProvider):
         def get_market_data(self, ticker, from_date, to_date):
             raise ProviderError("historical providers unavailable", status_code=503)
@@ -89,12 +89,13 @@ def test_both_historical_market_providers_failing_marks_job_with_clear_error(cli
     response = client.post("/api/v1/research", json={"ticker": "NVDA", "question": "Analyze the company's recent performance and major risks."}, headers=auth_headers(account["access_token"]))
     assert response.status_code == 200
     job_id = response.json()["data"]["id"]
-    failed = client.get(f"/api/v1/research/{job_id}", headers=auth_headers(account["access_token"])).json()["data"]
-    assert failed["status"] == "FAILED"
-    assert failed["error_message"] == "Historical market data is unavailable from all configured providers."
+    completed = client.get(f"/api/v1/research/{job_id}", headers=auth_headers(account["access_token"])).json()["data"]
+    assert completed["status"] == "COMPLETED"
+    assert completed["result"]["market_summary"]["evidence"] == []
+    assert completed["result"]["news_summary"]["evidence"]
 
 
-def test_required_news_provider_failure_still_fails_research_job(client):
+def test_news_provider_failure_preserves_market_evidence_and_completes_partial_research(client):
     class NewsUnavailableProvider(FakeResearchProvider):
         def get_news(self, ticker, from_date, to_date):
             raise ProviderError("down")
@@ -104,7 +105,10 @@ def test_required_news_provider_failure_still_fails_research_job(client):
     account = signup(client)
     response = client.post("/api/v1/research", json={"ticker": "NVDA", "question": "Analyze the company's recent performance and major risks."}, headers=auth_headers(account["access_token"]))
     job_id = response.json()["data"]["id"]
-    assert client.get(f"/api/v1/research/{job_id}", headers=auth_headers(account["access_token"])).json()["data"]["status"] == "FAILED"
+    completed = client.get(f"/api/v1/research/{job_id}", headers=auth_headers(account["access_token"])).json()["data"]
+    assert completed["status"] == "COMPLETED"
+    assert completed["result"]["news_summary"]["evidence"] == []
+    assert completed["result"]["market_summary"]["evidence"]
 
 
 def test_analysis_rejects_claim_with_unknown_evidence():

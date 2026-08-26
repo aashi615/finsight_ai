@@ -4,6 +4,7 @@ from fastapi import HTTPException
 import httpx
 import pytest
 from app.core.database import get_db
+from app.core.config import settings
 from app.api.v1.companies import get_research_service
 from app.providers.base import CompanyData, MarketBarData, NewsArticleData, ProviderError, UnknownTickerError
 from app.providers.finnhub import FinnhubProvider
@@ -160,6 +161,26 @@ def test_finnhub_resolves_company_name_to_canonical_ticker(monkeypatch):
     assert company.name == "NVIDIA Corporation"
 
 
+@pytest.mark.parametrize("payload", [
+    {"s": "ok", "t": [], "o": [], "h": [], "l": [], "c": []},
+    {"s": "ok", "t": [1], "o": [1], "h": [1], "l": [1], "c": [1], "v": ["bad"]},
+])
+def test_finnhub_200_malformed_candle_payload_is_controlled_provider_error(monkeypatch, payload):
+    def fake_get(url, *, params, timeout):
+        return type("Response", (), {"raise_for_status": lambda self: None, "json": lambda self: payload})()
+    monkeypatch.setattr(httpx, "get", fake_get)
+    with pytest.raises(ProviderError, match="malformed"):
+        FinnhubProvider(api_key="test-key").get_market_data("MSFT", date(2026, 1, 1), date(2026, 1, 3))
+
+
+def test_finnhub_200_malformed_news_payload_is_controlled_provider_error(monkeypatch):
+    def fake_get(url, *, params, timeout):
+        return type("Response", (), {"raise_for_status": lambda self: None, "json": lambda self: [{"headline": "missing url"}]})()
+    monkeypatch.setattr(httpx, "get", fake_get)
+    with pytest.raises(ProviderError, match="malformed"):
+        FinnhubProvider(api_key="test-key").get_news("MSFT", date(2026, 1, 1), date(2026, 1, 3))
+
+
 class StaticMarketProvider:
     def __init__(self, bars=None, error=None):
         self.bars = bars or []
@@ -223,7 +244,47 @@ def test_yahoo_empty_history_raises_clear_provider_error(monkeypatch):
         def history(self, **kwargs): return History()
     monkeypatch.setattr("app.providers.yahoo_finance.yf.Ticker", Ticker)
     with pytest.raises(ProviderError, match="no historical market data"):
-        YahooFinanceProvider().get_market_data("NVDA", date(2026, 1, 1), date(2026, 1, 3))
+        YahooFinanceProvider(retries=0).get_market_data("NVDA", date(2026, 1, 1), date(2026, 1, 3))
+
+
+def test_yahoo_empty_transient_response_retries_before_returning_data(monkeypatch):
+    class EmptyHistory:
+        empty = True
+    class History:
+        empty = False
+        def iterrows(self):
+            yield datetime(2026, 1, 2, tzinfo=timezone.utc), {"Open": 100, "High": 101, "Low": 99, "Close": 100, "Volume": 1}
+    class Ticker:
+        calls = 0
+        def __init__(self, symbol): pass
+        def history(self, **kwargs):
+            Ticker.calls += 1
+            return EmptyHistory() if Ticker.calls == 1 else History()
+    monkeypatch.setattr("app.providers.yahoo_finance.yf.Ticker", Ticker)
+    waits = []
+    bars = YahooFinanceProvider(retries=1, sleep=waits.append).get_market_data("MSFT", date(2026, 1, 1), date(2026, 1, 3))
+    assert len(bars) == 1
+    assert waits == [settings.yahoo_retry_seconds]
+
+
+def test_yahoo_transient_timeout_retries_once_before_accepting_valid_history(monkeypatch):
+    class History:
+        empty = False
+        def iterrows(self):
+            yield datetime(2026, 1, 2, tzinfo=timezone.utc), {"Open": 100, "High": 101, "Low": 99, "Close": 100, "Volume": 1}
+    class Ticker:
+        calls = 0
+        def __init__(self, symbol): pass
+        def history(self, **kwargs):
+            Ticker.calls += 1
+            if Ticker.calls == 1:
+                raise TimeoutError("provider timeout")
+            return History()
+    monkeypatch.setattr("app.providers.yahoo_finance.yf.Ticker", Ticker)
+    waits = []
+    bars = YahooFinanceProvider(retries=1, sleep=waits.append).get_market_data("MSFT", date(2026, 1, 1), date(2026, 1, 3))
+    assert len(bars) == 1
+    assert waits == [settings.yahoo_retry_seconds]
 
 
 def test_news_is_normalized_deduplicated_and_persisted(client):
@@ -232,6 +293,28 @@ def test_news_is_normalized_deduplicated_and_persisted(client):
     assert len(articles) == 1
     assert articles[0].url == "https://example.test/nvda"
     assert news.news_calls == 1
+
+
+def test_news_ingestion_is_idempotent_across_repeated_provider_batches(client):
+    service, _, _, db = service_and_db(client)
+    start = date(2026, 1, 1)
+    _, first = service.get_news(db, "NVDA", start, date(2026, 1, 3), limit=20)
+    _, second = service.get_news(db, "NVDA", start, date(2026, 1, 3), limit=20)
+    assert len(first) == len(second) == 1
+    assert first[0].url == second[0].url == "https://example.test/nvda"
+
+
+def test_news_ingestion_recovers_after_duplicate_url_conflict(client):
+    service, _, _, db = service_and_db(client)
+    company = service.resolve_company(db, "NVDA")
+    published_at = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    duplicate = NewsArticleData(title="Duplicate", summary=None, url="https://example.test/duplicate#fragment", published_at=published_at, source_name="Test", author=None)
+    service._persist_news(db, company, [duplicate, duplicate])
+    # A second ingestion is the production race/conflict shape: it must be a
+    # no-op instead of surfacing uq_news_articles_url.
+    service._persist_news(db, company, [duplicate])
+    _, articles = service.get_news(db, "NVDA", date(2026, 1, 1), date(2026, 1, 3), limit=20)
+    assert [item.url for item in articles].count("https://example.test/duplicate") == 1
 
 
 def test_news_provider_failure_is_clean(client):
