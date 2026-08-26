@@ -46,6 +46,26 @@ def _with_stable_evidence_ids(analysis, source_agent: str):
     return analysis.model_copy(update={"evidence": evidence})
 
 
+def _branch_evidence(analysis) -> list[Evidence]:
+    """Return canonical evidence whether it is stored top-level or on claims.
+
+    New Pydantic outputs require claim evidence to also be top-level.  This
+    additionally supports already-persisted/legacy branch state where the
+    evidence was retained only beneath ``signals`` or ``findings``.
+    """
+    candidates = list(analysis.evidence)
+    for claim in [*getattr(analysis, "signals", []), *getattr(analysis, "findings", [])]:
+        candidates.extend(claim.evidence)
+    canonical: list[Evidence] = []
+    seen = set()
+    for item in candidates:
+        identity = evidence_identity(item)
+        if identity not in seen:
+            seen.add(identity)
+            canonical.append(item)
+    return canonical
+
+
 def _canonical_synthesis_evidence(result: ResearchSynthesis, manifest: dict[str, Evidence]) -> ResearchSynthesis:
     """Validate model-selected manifest IDs and restore canonical evidence data."""
     returned_ids = [item.evidence_id for item in result.evidence]
@@ -78,17 +98,26 @@ def _canonical_synthesis_evidence(result: ResearchSynthesis, manifest: dict[str,
     return result.model_copy(update={"evidence": canonical(result.evidence), "key_risks": risks, "key_opportunities": opportunities})
 
 
-async def _complete_validated(llm: LLMProvider, model, prompt: str, payload: dict, *, agent: str, max_output_tokens: int):
+async def _complete_validated(llm: LLMProvider, model, prompt: str, payload: dict, *, agent: str, max_output_tokens: int, require_evidence: bool = False, supplied_evidence: list[Evidence] | None = None):
     """Use the provider fallback once when local schema validation rejects GPT-OSS."""
+    def validate_response(response):
+        result = _validate(model, response, agent=agent)
+        if require_evidence and not result.evidence:
+            logger.warning("agent_required_evidence_missing", extra={"agent": agent, "supplied_evidence_count": len(payload.get("evidence", [])), "returned_evidence_count": 0})
+            raise AgentFailure("LLM returned no evidence despite supplied source evidence.", category="llm_invalid_response")
+        if supplied_evidence is not None:
+            result = _only_supplied_evidence(result, supplied_evidence)
+        return result
+
     try:
         response = await llm.complete_json(prompt, payload, agent=agent, max_output_tokens=max_output_tokens)
-        return _validate(model, response, agent=agent)
+        return validate_response(response)
     except AgentFailure:
         if agent == "research_synthesizer":
             raise
         try:
             response = await llm.complete_json(prompt, payload, agent=agent, max_output_tokens=max_output_tokens, force_fallback=True)
-            return _validate(model, response, agent=agent)
+            return validate_response(response)
         except LLMProviderError:
             raise
 
@@ -106,10 +135,10 @@ class MarketAnalystAgent:
         closes = [float(row.close) for row in rows]
         metrics = {"start_close": closes[0], "end_close": closes[-1], "price_change": closes[-1] - closes[0], "price_change_percent": ((closes[-1] - closes[0]) / closes[0] * 100) if closes[0] else 0.0, "high_close": max(closes), "low_close": min(closes)}
         payload = {"question": context["question"][:500], "market": [{"timestamp": row.timestamp.date().isoformat(), "close": str(row.close), "volume": row.volume} for row in rows], "calculated_metrics": metrics, "evidence": [item.model_dump() for item in evidence]}
-        result = await self._complete(MarketAnalysis, market.PROMPT, payload)
-        return _only_supplied_evidence(result.model_copy(update={"metrics": metrics}), evidence)
-    async def _complete(self, model, prompt, payload):
-        try: return await _complete_validated(self.llm, model, prompt, payload, agent="market_analyst", max_output_tokens=settings.market_max_output_tokens)
+        result = await self._complete(MarketAnalysis, market.PROMPT, payload, require_evidence=True, supplied_evidence=evidence)
+        return result.model_copy(update={"metrics": metrics})
+    async def _complete(self, model, prompt, payload, *, require_evidence: bool = False, supplied_evidence: list[Evidence] | None = None):
+        try: return await _complete_validated(self.llm, model, prompt, payload, agent="market_analyst", max_output_tokens=settings.market_max_output_tokens, require_evidence=require_evidence, supplied_evidence=supplied_evidence)
         except LLMProviderError as exc: raise AgentFailure("Market agent failed.", category=exc.category) from exc
 
 
@@ -122,7 +151,7 @@ class NewsAnalystAgent:
             return NewsAnalysis(summary="No recent news is available.", themes=[], signals=[], evidence=[])
         evidence = evidence[:settings.news_article_limit]
         payload = {"question": context["question"][:500], "articles": [{"source_id": str(article.id), "title": article.title[:180], "summary": (article.summary or "")[:settings.news_article_snippet_chars], "published_at": article.published_at.date().isoformat()} for article in articles[:settings.news_article_limit]], "evidence": [item.model_dump() for item in evidence]}
-        try: return _only_supplied_evidence(await _complete_validated(self.llm, NewsAnalysis, news.PROMPT, payload, agent="news_analyst", max_output_tokens=settings.news_max_output_tokens), evidence)
+        try: return await _complete_validated(self.llm, NewsAnalysis, news.PROMPT, payload, agent="news_analyst", max_output_tokens=settings.news_max_output_tokens, require_evidence=True, supplied_evidence=evidence)
         except LLMProviderError as exc: raise AgentFailure("News agent failed.", category=exc.category) from exc
 
 
@@ -135,13 +164,18 @@ class DocumentRagAgent:
             return DocumentAnalysis(summary="No tenant-owned documents matched this request.", findings=[], evidence=[])
         evidence = evidence[:settings.rag_top_k]
         payload = {"question": question[:500], "chunks": [{"document_id": str(chunk.document_id), "source": chunk.source_url, "page_number": chunk.page_number, "section": chunk.section, "text": chunk.content[:settings.rag_chunk_chars]} for chunk in chunks], "evidence": [item.model_dump() for item in evidence]}
-        try: return _only_supplied_evidence(await _complete_validated(self.llm, DocumentAnalysis, document.PROMPT, payload, agent="document_rag_agent", max_output_tokens=settings.rag_max_output_tokens), evidence)
+        try: return await _complete_validated(self.llm, DocumentAnalysis, document.PROMPT, payload, agent="document_rag_agent", max_output_tokens=settings.rag_max_output_tokens, require_evidence=True, supplied_evidence=evidence)
         except LLMProviderError as exc: raise AgentFailure("Document agent failed.", category=exc.category) from exc
 
 
 class ResearchSynthesizer:
     def __init__(self, llm: LLMProvider): self.llm = llm
     async def synthesize(self, market_analysis: MarketAnalysis | None, news_analysis: NewsAnalysis | None, document_analysis: DocumentAnalysis | None) -> ResearchSynthesis:
+        # Normalize legacy/persisted branch summaries before testing whether
+        # synthesis has usable evidence. Any valid branch evidence is enough.
+        market_analysis = market_analysis.model_copy(update={"evidence": _branch_evidence(market_analysis)}) if market_analysis else None
+        news_analysis = news_analysis.model_copy(update={"evidence": _branch_evidence(news_analysis)}) if news_analysis else None
+        document_analysis = document_analysis.model_copy(update={"evidence": _branch_evidence(document_analysis)}) if document_analysis else None
         market_analysis = _with_stable_evidence_ids(market_analysis, "market") if market_analysis else None
         news_analysis = _with_stable_evidence_ids(news_analysis, "news") if news_analysis else None
         document_analysis = _with_stable_evidence_ids(document_analysis, "rag") if document_analysis else None
@@ -168,9 +202,20 @@ class ResearchSynthesizer:
             extra={"agent": "research_synthesizer", "valid_upstream_evidence_ids": list(manifest), "evidence_manifest": [{"evidence_id": item["evidence_id"], "source_agent": item["source_agent"], "source_type": item["source_type"]} for item in evidence_manifest]},
         )
         payload = {"news_summary": news_analysis.model_dump() if news_analysis else None, "market_summary": market_analysis.model_dump() if market_analysis else None, "rag_summary": document_analysis.model_dump() if document_analysis else None, "evidence_manifest": evidence_manifest}
-        try: result = await _complete_validated(self.llm, ResearchSynthesis, synthesis.PROMPT, payload, agent="research_synthesizer", max_output_tokens=settings.final_max_output_tokens)
+        try:
+            result = await _complete_validated(self.llm, ResearchSynthesis, synthesis.PROMPT, payload, agent="research_synthesizer", max_output_tokens=settings.final_max_output_tokens)
+            return _canonical_synthesis_evidence(result, manifest)
+        except AgentFailure as primary_error:
+            # Qwen is already the normal final model. A manifest/schema failure
+            # gets one smaller corrective prompt through the same provider TPM
+            # scheduler, rather than failing a job after an otherwise usable run.
+            logger.warning("synthesizer_validation_retry", extra={"agent": "research_synthesizer", "error_category": primary_error.category})
+            try:
+                response = await self.llm.complete_json(synthesis.COMPACT_RETRY_PROMPT, payload, agent="research_synthesizer", max_output_tokens=settings.final_max_output_tokens)
+                return _canonical_synthesis_evidence(_validate(ResearchSynthesis, response, agent="research_synthesizer"), manifest)
+            except LLMProviderError as exc:
+                raise AgentFailure("Synthesizer failed.", category=exc.category) from exc
         except LLMProviderError as exc: raise AgentFailure("Synthesizer failed.", category=exc.category) from exc
-        return _canonical_synthesis_evidence(result, manifest)
 
 
 def _sample(items: list, limit: int) -> list:

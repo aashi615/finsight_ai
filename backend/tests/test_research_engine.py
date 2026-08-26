@@ -143,6 +143,23 @@ def test_news_agent_valid_json_parses_to_news_analysis():
     assert result == NewsAnalysis(summary="valid", themes=["earnings"], signals=[], evidence=[{"source_type": "NEWS", "source_id": "news-1", "snippet": "NVIDIA update", "url": "https://example.test/news"}])
 
 
+def test_news_agent_retries_with_fallback_when_primary_returns_empty_evidence():
+    class CompactLLM:
+        calls = []
+        async def complete_json(self, prompt, payload, **kwargs):
+            self.calls.append(kwargs.get("force_fallback", False))
+            evidence = payload["evidence"]
+            if not kwargs.get("force_fallback"):
+                return {"agent": "news_analyst", "summary": "No material change.", "themes": [], "signals": [], "evidence": []}
+            return {"agent": "news_analyst", "summary": "No material change.", "themes": [], "signals": [], "evidence": evidence[:1]}
+
+    article = SimpleNamespace(id="news-1", title="NVIDIA update", summary="Summary", url="https://example.test/news", published_at=datetime.now(timezone.utc))
+    llm = CompactLLM()
+    result = asyncio.run(NewsAnalystAgent(llm).analyze({"question": "What changed?", "news": [article]}))
+    assert [item.source_id for item in result.evidence] == ["news-1"]
+    assert llm.calls == [False, True]
+
+
 def test_market_agent_schema_invalid_json_has_clear_validation_error():
     class SchemaInvalidLLM:
         async def complete_json(self, *args, **kwargs):
@@ -223,6 +240,23 @@ def test_synthesis_rejects_duplicate_or_unavailable_evidence_reference():
     news = NewsAnalysis(summary="news", themes=[], signals=[], evidence=[Evidence(source_type="NEWS", source_id="source-1", snippet="Canonical title")])
     with pytest.raises(AgentFailure, match="unsupported evidence"):
         asyncio.run(ResearchSynthesizer(InvalidEvidenceLLM()).synthesize(None, news, None))
+
+
+def test_synthesis_uses_valid_claim_evidence_when_legacy_branch_top_level_evidence_is_empty():
+    class CapturingLLM:
+        async def complete_json(self, prompt, payload, **kwargs):
+            assert payload["evidence_manifest"][0]["evidence_id"] == "news_001"
+            source = payload["news_summary"]["evidence"][0]
+            cited = {"evidence_id": "news_001", **source}
+            return {"executive_summary": "Summary.", "company_overview": "Overview.", "market_analysis": "Market unavailable.", "news_analysis": "News available.", "key_risks": [], "key_opportunities": [], "evidence": [cited], "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat()}
+
+    evidence = Evidence(source_type="NEWS", source_id="news-1", snippet="News evidence", url="https://example.test/news")
+    validated = NewsAnalysis(summary="news", themes=[], signals=[{"claim": "Signal", "evidence": [evidence.model_dump()]}], evidence=[evidence])
+    # Simulates historical/persisted state whose claim evidence survived but
+    # top-level evidence was previously serialized as an empty list.
+    legacy = validated.model_copy(update={"evidence": []})
+    result = asyncio.run(ResearchSynthesizer(CapturingLLM()).synthesize(None, legacy, None))
+    assert result.evidence[0].source_id == "news-1"
 
 
 def test_partial_agent_failure_preserves_successful_summary():
