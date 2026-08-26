@@ -104,6 +104,29 @@ def _canonical_synthesis_evidence(result: ResearchSynthesis, manifest: dict[str,
     return result.model_copy(update={"evidence": canonical(result.evidence), "key_risks": risks, "key_opportunities": opportunities})
 
 
+def _normalize_synthesis_response(payload: dict) -> dict:
+    """Apply the one narrow compatibility normalization before Pydantic.
+
+    The public contract is arrays of evidence-backed claims. Some models return
+    one bare risk/opportunity string despite otherwise valid JSON. Preserve it
+    as a one-item array only when the response already contains a concrete
+    top-level evidence object; otherwise leave the payload untouched so strict
+    Pydantic validation rejects it.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    top_level_evidence = payload.get("evidence")
+    if not isinstance(top_level_evidence, list) or not top_level_evidence:
+        return payload
+    normalized = dict(payload)
+    for field in ("key_risks", "key_opportunities"):
+        value = normalized.get(field)
+        if isinstance(value, str) and value.strip():
+            normalized[field] = [{"claim": value.strip(), "evidence": [top_level_evidence[0]]}]
+            logger.info("synthesizer_array_field_normalized", extra={"agent": "research_synthesizer", "normalized_field": field})
+    return normalized
+
+
 async def _complete_validated(llm: LLMProvider, model, prompt: str, payload: dict, *, agent: str, max_output_tokens: int, require_evidence: bool = False, supplied_evidence: list[Evidence] | None = None):
     """Use the provider fallback once when local schema validation rejects GPT-OSS."""
     def validate_response(response):
@@ -209,7 +232,8 @@ class ResearchSynthesizer:
         )
         payload = {"news_summary": news_analysis.model_dump() if news_analysis else None, "market_summary": market_analysis.model_dump() if market_analysis else None, "rag_summary": document_analysis.model_dump() if document_analysis else None, "evidence_manifest": evidence_manifest}
         try:
-            result = await _complete_validated(self.llm, ResearchSynthesis, synthesis.PROMPT, payload, agent="research_synthesizer", max_output_tokens=settings.final_max_output_tokens)
+            response = await self.llm.complete_json(synthesis.PROMPT, payload, agent="research_synthesizer", max_output_tokens=settings.final_max_output_tokens)
+            result = _validate(ResearchSynthesis, _normalize_synthesis_response(response), agent="research_synthesizer")
             return _canonical_synthesis_evidence(result, manifest)
         except AgentFailure as primary_error:
             # Qwen is already the normal final model. A manifest/schema failure
@@ -218,7 +242,7 @@ class ResearchSynthesizer:
             logger.warning("synthesizer_validation_retry", extra={"agent": "research_synthesizer", "error_category": primary_error.category})
             try:
                 response = await self.llm.complete_json(synthesis.COMPACT_RETRY_PROMPT, payload, agent="research_synthesizer", max_output_tokens=settings.final_max_output_tokens)
-                return _canonical_synthesis_evidence(_validate(ResearchSynthesis, response, agent="research_synthesizer"), manifest)
+                return _canonical_synthesis_evidence(_validate(ResearchSynthesis, _normalize_synthesis_response(response), agent="research_synthesizer"), manifest)
             except LLMProviderError as exc:
                 raise AgentFailure("Synthesizer failed.", category=exc.category) from exc
         except LLMProviderError as exc: raise AgentFailure("Synthesizer failed.", category=exc.category) from exc

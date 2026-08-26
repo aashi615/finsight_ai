@@ -361,7 +361,7 @@ class GroqProvider:
             # every six seconds only creates noisy delayed logs and cannot add
             # TPM capacity before the oldest rolling reservation expires.
             poll_delay = delay
-            logger.warning("llm_request_delayed", extra={"provider": "groq", "agent": agent, "model": model, "estimated_input_tokens": estimated_input, "configured_max_output_tokens": configured_output, "requested_max_output_tokens": requested_output, "estimated_tokens": estimated_input + minimum_output, "available_tpm": available, "delay_seconds": round(poll_delay, 3), "reason": "tpm_budget", "retry_number": retry_number})
+            logger.warning("llm_request_delayed", extra={"provider": "groq", "agent": agent, "model": model, "estimated_input_tokens": estimated_input, "configured_max_output_tokens": configured_output, "requested_max_output_tokens": minimum_output, "estimated_tokens": estimated_input + minimum_output, "available_tpm": available, "delay_seconds": round(poll_delay, 3), "reason": "tpm_budget", "retry_number": retry_number})
             self._sleep(poll_delay)
 
     @staticmethod

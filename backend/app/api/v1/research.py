@@ -33,7 +33,10 @@ def get_orchestrator() -> ResearchOrchestrator:
 
 
 def job_out(db: Session, job) -> ResearchJobOut:
-    report = reports.get_for_job_in_organization(db, job.id, job.organization_id)
+    # Polling pending/running jobs must be one indexed job lookup only. A
+    # report cannot exist until completion, so skip its otherwise redundant DB
+    # query on every frontend status poll.
+    report = reports.get_for_job_in_organization(db, job.id, job.organization_id) if job.status.value == "COMPLETED" else None
     return ResearchJobOut.model_validate(job).model_copy(update={"report_id": report.id if report else None})
 
 

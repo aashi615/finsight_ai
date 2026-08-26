@@ -8,8 +8,8 @@ import pytest
 from app.api.v1.research import get_orchestrator
 from app.core.database import get_db
 from app.providers.base import ProviderError
-from app.schemas.research import DocumentAnalysis, Evidence, MarketAnalysis, NewsAnalysis
-from app.services.agents import AgentFailure, DocumentRagAgent, MarketAnalystAgent, NewsAnalystAgent, ResearchSynthesizer
+from app.schemas.research import DocumentAnalysis, Evidence, MarketAnalysis, NewsAnalysis, ResearchSynthesis
+from app.services.agents import AgentFailure, DocumentRagAgent, MarketAnalystAgent, NewsAnalystAgent, ResearchSynthesizer, _normalize_synthesis_response, _validate
 from app.services.rag_service import RagService
 from app.services.research_orchestrator import ResearchOrchestrator
 from app.services.research_service import ResearchService
@@ -138,6 +138,38 @@ def test_synthesis_rejects_risk_that_is_not_cited_in_top_level_evidence():
             key_opportunities=[], evidence=[{"source_type": "NEWS", "source_id": "right", "snippet": "right"}],
             confidence=0.5, generated_at=datetime.now(timezone.utc),
         )
+
+
+@pytest.mark.parametrize(
+    ("risks", "opportunities", "expected_risks", "expected_opportunities"),
+    [
+        ([{"claim": "Risk", "evidence": [{"source_type": "NEWS", "source_id": "news_001", "snippet": "Evidence"}]}], [], 1, 0),
+        ("Risk as string", [], 1, 0),
+        ([], "Opportunity as string", 0, 1),
+        ("Risk as string", "Opportunity as string", 1, 1),
+    ],
+)
+def test_synthesizer_normalizes_only_string_array_fields_to_evidence_backed_arrays(risks, opportunities, expected_risks, expected_opportunities):
+    payload = {
+        "executive_summary": "Summary", "company_overview": "Overview", "market_analysis": "Market", "news_analysis": "News",
+        "key_risks": risks, "key_opportunities": opportunities,
+        "evidence": [{"source_type": "NEWS", "source_id": "news_001", "snippet": "Evidence"}],
+        "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    result = _validate(ResearchSynthesis, _normalize_synthesis_response(payload), agent="research_synthesizer")
+    assert len(result.key_risks) == expected_risks
+    assert len(result.key_opportunities) == expected_opportunities
+
+
+def test_synthesizer_normalization_does_not_coerce_unrelated_malformed_fields():
+    payload = {
+        "executive_summary": ["not text"], "company_overview": "Overview", "market_analysis": "Market", "news_analysis": "News",
+        "key_risks": "Risk", "key_opportunities": [],
+        "evidence": [{"source_type": "NEWS", "source_id": "news_001", "snippet": "Evidence"}],
+        "confidence": 0.5, "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with pytest.raises(AgentFailure, match="invalid structured analysis"):
+        _validate(ResearchSynthesis, _normalize_synthesis_response(payload), agent="research_synthesizer")
 
 
 @pytest.mark.parametrize("evidence", [
