@@ -9,6 +9,8 @@ Instead of manually collecting information from multiple sources, FinSightAI use
 > ⚠️ **Disclaimer:** FinSightAI is a research assistant and does **not** provide financial advice or investment recommendations.
 
 ---
+Vercel Link : https://finsight-ai-rust.vercel.app/
+Backend is deployed on Render and database on Supabase
 
 ## ✨ Key Features
 
